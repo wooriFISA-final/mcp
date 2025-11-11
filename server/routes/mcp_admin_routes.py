@@ -192,3 +192,13 @@ async def debug_mcp():
         "sample_resource_keys": list(resources.keys())[:3] if resources else [],
         "sample_prompt_keys": list(prompts.keys())[:3] if prompts else [],
     }
+
+
+@router.get("/test-connection")
+async def test_connection():
+    """브라우저 테스트용 엔드포인트"""
+    return {
+        "status": "ok",
+        "message": "MCP Server is running",
+        "note": "The /mcp endpoint requires SSE (text/event-stream) and cannot be tested in browser directly. Use the Python client instead."
+    }

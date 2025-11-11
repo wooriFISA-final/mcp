@@ -24,3 +24,4 @@ mcp.resource("user://database/all")(get_all_users_resource)
 # Prompts 등록
 mcp.prompt()(user_greeting)
 mcp.prompt()(user_report)
+

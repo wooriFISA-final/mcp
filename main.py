@@ -17,19 +17,7 @@ app = FastAPI(
     version="0.1.0"
 )
 
-# CORS 미들웨어 설정
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 app.include_router(mcp_admin_router)
-
-app.mount("/mcp/", mcp.http_app())
-
 
 @app.get("/")
 async def root():
@@ -39,6 +27,27 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+# app.mount('/mcp',mcp.http_app(transport='http'))
+# Combine mcp and fastapi
+mcp_app = mcp.http_app(transport='http')
+routes = [
+    *mcp_app.routes,
+    *app.routes
+]
+app = FastAPI(
+    routes=routes,
+    lifespan=mcp_app.lifespan,
+)
+
+# 2. Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 
 if __name__ == "__main__":
@@ -50,7 +59,6 @@ if __name__ == "__main__":
     logger.info("ℹ️  Server Info: http://0.0.0.0:8000/info")
     logger.info("🔧 REST API: http://0.0.0.0:8000/api/users")
     logger.info("=" * 60)
-    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
