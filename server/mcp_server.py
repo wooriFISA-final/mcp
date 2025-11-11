@@ -1,9 +1,13 @@
+# ============================================
+# server/mcp_server.py
+# ============================================
 from fastmcp import FastMCP
 from server.tools.user_tools import create_user, get_user, update_user, delete_user, list_users, search_users
 from server.resources.user_resources import get_user_stats, get_all_users_resource
 from server.prompts.user_prompts import user_greeting, user_report
 
-mcp = FastMCP(name="user-management-server", version="0.1.0")
+# FastMCP 인스턴스 생성 
+mcp = FastMCP(name="fisa-mcp", version="0.1.0")
 
 # Tools 등록
 mcp.tool()(create_user)

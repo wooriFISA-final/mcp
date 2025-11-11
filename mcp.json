@@ -1,0 +1,29 @@
+{
+  "$schema": "https://gofastmcp.com/public/schemas/fastmcp.json/v1.json",
+  //서버 정보
+  "source": {
+    "path": "mcp/main.py",
+    "entrypoint": "fisa-mcp"
+  },
+  // uv.lock으로 변경할 예정
+  "environment": {
+    "python": "3.11",
+    "requirements": "requirements/production.txt",
+    "project": "."
+  },
+  // 실행 정보
+  "deployment": {
+    "transport": "http",
+    "host": "0.0.0.0",
+    "port": 3000,
+    "path": "/api/mcp/",
+    "log_level": "INFO",
+    "env": {
+      "ENV": "production",
+      "API_BASE_URL": "https://api.example.com",
+      "DATABASE_URL": "postgresql://user:pass@db.example.com/prod"
+    },
+    "cwd": "/app",
+    "args": ["--workers", "4"]
+  }
+}

@@ -1,12 +1,13 @@
 from datetime import datetime
 from typing import Optional
 from config.logger import get_logger
-
+import mcp
 logger = get_logger(__name__)
 
 # 임시 인메모리 DB
 USERS_DB = {}
 USER_COUNTER = 0
+
 
 async def create_user(name: str, email: str, age: int, phone: Optional[str] = None) -> dict:
     global USER_COUNTER
