@@ -2,26 +2,39 @@
 # server/mcp_server.py
 # ============================================
 from fastmcp import FastMCP
-from server.tools.user_tools import create_user, get_user, update_user, delete_user, list_users, search_users
-from server.resources.user_resources import get_user_stats, get_all_users_resource
-from server.prompts.user_prompts import user_greeting, user_report
+from fastapi import FastAPI
+from server.api.mcp_admin_routes import create_mcp_admin_router
+from server.routes import mcp_route
 
-# FastMCP 인스턴스 생성 
-mcp = FastMCP(name="fisa-mcp", version="0.1.0")
 
-# Tools 등록
-mcp.tool()(create_user)
-mcp.tool()(get_user)
-mcp.tool()(update_user)
-mcp.tool()(delete_user)
-mcp.tool()(list_users)
-mcp.tool()(search_users)
+instructions = (
+    "이 MCP 서버는 ~~~ 조회 기능을 제공합니다."
+)
+# MCP Tools용 앱 (MCP로 변환될 API들)
+tools_app = FastAPI()
+tools_app.include_router(mcp_route.mcp_router)
 
-# Resources 등록
-mcp.resource("user://database/stats")(get_user_stats)
-mcp.resource("user://database/all")(get_all_users_resource)
+# all_app.include_router(report_route) -> 추후에 추가 / 수정 예정
 
-# Prompts 등록
-mcp.prompt()(user_greeting)
-mcp.prompt()(user_report)
+# FastAPI의 API 전체를 MCP 도구 세트로 래핑하고 MCP 서버 객체를 생성.
+mcp = FastMCP.from_fastapi(
+    tools_app,
+    name="fisa-mcp", 
+    instructions = instructions,
+    version="0.1.0")
+
+
+# 전체 API 앱 (일반 REST API)
+all_app = FastAPI()
+all_app.include_router(mcp_route.mcp_router)  # 원본 API
+all_app.include_router(create_mcp_admin_router(mcp))  # MCP 관리 API
+
+# stateless_http=True -> 클라이언트의 요청이 대폭 증가해도 서버를 증설해결 가능
+# MCP JSON‑RPC 서브 앱 생성
+mcp_app = mcp.http_app(
+    path="/",
+    transport="http",
+    stateless_http=True,
+    json_response=True
+)
 

@@ -1,8 +1,9 @@
 from datetime import datetime
-from server.tools.user_tools import USERS_DB
+from server.api.tools.user_tools import USERS_DB
 from config.logger import get_logger
 
 logger = get_logger(__name__)
+
 
 async def get_user_stats() -> str:
     logger.info("Fetching user stats")
@@ -15,6 +16,7 @@ async def get_user_stats() -> str:
         elif age<40: age_groups["30대"]+=1
         else: age_groups["40대+"]+=1
     return f"전체 사용자: {total}\n10대:{age_groups['10대']},20대:{age_groups['20대']},30대:{age_groups['30대']},40대+:{age_groups['40대+']}"
+
 
 async def get_all_users_resource() -> str:
     logger.info("Fetching all users")
