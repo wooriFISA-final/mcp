@@ -1,7 +1,5 @@
 from fastapi import APIRouter
-from server.api import mcp_admin_routes
-from server.mcp_server import mcp
+from server.api.resources import db_tools
 
-# mcp_admin_router = APIRouter()
-# mcp_admin_router.include_router(mcp_admin_routes.create_mcp_admin_router(mcp))
-
+resource_router = APIRouter()
+resource_router.include_router(db_tools.router)

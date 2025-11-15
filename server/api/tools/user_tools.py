@@ -26,14 +26,13 @@ async def create_user(name: str, age: int) -> dict:
     USER_COUNTER += 1
     user_id = f"user_{USER_COUNTER}"
     user_data = {
-        "id": user_id,
         "name": name,
         "age": age,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat()
     }
-    USERS_DB[user_id] = user_data
-    return {"success": True, "user": user_data}
+    USERS_DB[name] = user_data
+    return {"tool_name": "create_user", "success": True, "user": user_data}
 
 @router.get(
     "/get_user",
@@ -46,5 +45,5 @@ async def create_user(name: str, age: int) -> dict:
 async def get_user(name: str) -> dict:
     if name not in USERS_DB:
         return {"success": False, "error": f"User {name} not found", "user": None}
-    return {"success": True, "user": USERS_DB[name]}
+    return {"tool_name": "get_user", "success": True, "user": USERS_DB[name]}
 
