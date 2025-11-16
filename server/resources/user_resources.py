@@ -2,7 +2,7 @@ from datetime import datetime
 from server.tools.user_tools import USERS_DB
 from config.logger import get_logger
 
-logger = get_logger(__name__)
+logger = get_logger(__name__) 
 
 async def get_user_stats() -> str:
     logger.info("Fetching user stats")
