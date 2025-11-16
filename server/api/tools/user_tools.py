@@ -2,6 +2,10 @@ from datetime import datetime
 from typing import Optional
 from config.logger import get_logger
 from fastapi import APIRouter
+from server.schemas.user_schema import (
+    UserCreateRequest,
+    UserGetRequest
+)
 
 logger = get_logger(__name__)
 
@@ -21,17 +25,14 @@ router = APIRouter(
     response_model=dict, # 추후에 형식이 지정되면 그걸로 설정
 
 )
-async def create_user(name: str, age: int) -> dict:
-    global USER_COUNTER
-    USER_COUNTER += 1
-    user_id = f"user_{USER_COUNTER}"
+async def create_user(requset:UserCreateRequest) -> dict:
     user_data = {
-        "name": name,
-        "age": age,
+        "name": requset.name,
+        "age": requset.age,
         "created_at": datetime.now().isoformat(),
         "updated_at": datetime.now().isoformat()
     }
-    USERS_DB[name] = user_data
+    USERS_DB[requset.name] = user_data
     return {"tool_name": "create_user", "success": True, "user": user_data}
 
 @router.get(
@@ -42,8 +43,8 @@ async def create_user(name: str, age: int) -> dict:
     response_model=dict, # 추후에 형식이 지정되면 그걸로 설정
 
 )
-async def get_user(name: str) -> dict:
-    if name not in USERS_DB:
-        return {"success": False, "error": f"User {name} not found", "user": None}
-    return {"tool_name": "get_user", "success": True, "user": USERS_DB[name]}
+async def get_user(request:UserGetRequest) -> dict:
+    if request.name not in USERS_DB:
+        return {"success": False, "error": f"User {request.name} not found", "user": None}
+    return {"tool_name": "get_user", "success": True, "user": USERS_DB[request.name]}
 
