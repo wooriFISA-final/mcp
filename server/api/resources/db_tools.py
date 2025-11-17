@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from fastapi import APIRouter, Body
 from sqlalchemy import create_engine, text
@@ -56,6 +56,7 @@ async def api_get_market_price(
 
     if not location or not housing_type:
         return {
+            "tool_name": "get_market_price",
             "success": False,
             "avg_price": 0,
             "error": "location과 housing_type은 필수입니다.",
@@ -82,12 +83,14 @@ async def api_get_market_price(
             ).scalar()
 
         return {
+            "tool_name": "get_market_price",
             "success": True,
             "avg_price": int(avg_price or 0),
         }
     except Exception as e:
         logger.error(f"get_market_price Error: {e}", exc_info=True)
         return {
+            "tool_name": "get_market_price",
             "success": False,
             "avg_price": 0,
             "error": str(e),
@@ -198,17 +201,23 @@ async def api_upsert_member_and_plan(
                 )
 
         logger.info(f"💾 DB upsert 완료 — user_id={user_id}")
-        return {"success": True, "user_id": user_id}
+        return {
+            "tool_name": "upsert_member_and_plan",
+            "success": True,
+            "user_id": user_id,
+        }
 
     except Exception as e:
         logger.error(f"upsert_member_and_plan Error: {e}", exc_info=True)
         return {
+            "tool_name": "upsert_member_and_plan",
             "success": False,
             "user_id": payload.get("user_id", 1),
             "error": str(e),
         }
 
-# 3. 대출 결과 반영
+
+# 3. 대출 결과 반영 (DSR/DTI 포함 가능)
 @router.post(
     "/update_loan_result",
     summary="대출 결과 DB 반영 (plans + members)",
@@ -219,11 +228,13 @@ async def api_upsert_member_and_plan(
         "- user_id: 사용자 ID (예: 1)\n"
         "- loan_amount: 최종 대출 금액 (예: 280000000)\n"
         "- shortage_amount: 부족 자금 (예: 120000000)\n"
-        "- product_id: 대출 상품 ID (예: 1)\n\n"
+        "- product_id: 대출 상품 ID (예: 1)\n"
+        "- dsr: 최종 적용된 DSR 비율(%) (선택)\n"
+        "- dti: 최종 적용된 DTI 비율(%) (선택)\n\n"
         "동작:\n"
         "1) plans 테이블에서 해당 user_id의 최신 plan(plan_id DESC)을 찾습니다.\n"
         "2) 해당 plan의 loan_amount, product_id를 업데이트합니다.\n"
-        "3) members 테이블의 shortage_amount를 업데이트합니다.\n\n"
+        "3) members 테이블의 shortage_amount 및 dsr, dti를 업데이트합니다(값이 있을 경우).\n\n"
         "출력 필드:\n"
         "- success: 처리 성공 여부(Boolean)\n"
         "- user_id: 처리된 사용자 ID\n"
@@ -236,7 +247,7 @@ async def update_loan_result(payload: Dict[str, Any] = Body(...)) -> dict:
     """
     LoanAgent.update_db와 동일한 동작을 HTTP Tool로 노출한 버전.
     - plans.loan_amount, plans.product_id
-    - members.shortage_amount
+    - members.shortage_amount (+ dsr, dti 선택 업데이트)
     를 한 번에 업데이트한다.
     """
     try:
@@ -245,8 +256,13 @@ async def update_loan_result(payload: Dict[str, Any] = Body(...)) -> dict:
         shortage_amount = int(payload.get("shortage_amount") or 0)
         product_id = payload.get("product_id")
 
+        # DSR/DTI는 선택값(없으면 기존값 유지)
+        dsr = payload.get("dsr")
+        dti = payload.get("dti")
+
         if product_id is None:
             return {
+                "tool_name": "update_loan_result",
                 "success": False,
                 "user_id": user_id,
                 "updated_plan_id": None,
@@ -265,6 +281,7 @@ async def update_loan_result(payload: Dict[str, Any] = Body(...)) -> dict:
 
             if not plan_id:
                 return {
+                    "tool_name": "update_loan_result",
                     "success": False,
                     "user_id": user_id,
                     "updated_plan_id": None,
@@ -286,32 +303,44 @@ async def update_loan_result(payload: Dict[str, Any] = Body(...)) -> dict:
                 },
             )
 
-            # 3) members.shortage_amount 업데이트
+            # 3) members.shortage_amount + dsr + dti 업데이트
             conn.execute(
-                text("UPDATE members SET shortage_amount = :s WHERE user_id = :uid"),
-                {"s": shortage_amount, "uid": user_id},
+                text("""
+                    UPDATE members
+                    SET shortage_amount = :s,
+                        dsr = COALESCE(:dsr, dsr),
+                        dti = COALESCE(:dti, dti)
+                    WHERE user_id = :uid
+                """),
+                {"s": shortage_amount, "dsr": dsr, "dti": dti, "uid": user_id},
             )
 
         logger.info(
             f"✅ update_loan_result 완료 — user_id={user_id}, "
-            f"plan_id={plan_id}, loan_amount={loan_amount:,}, shortage={shortage_amount:,}"
+            f"plan_id={plan_id}, loan_amount={loan_amount:,}, "
+            f"shortage={shortage_amount:,}, dsr={dsr}, dti={dti}"
         )
         return {
+            "tool_name": "update_loan_result",
             "success": True,
             "user_id": user_id,
             "updated_plan_id": int(plan_id),
+            "dsr": dsr,
+            "dti": dti,
         }
 
     except Exception as e:
         logger.error(f"update_loan_result Error: {e}", exc_info=True)
         return {
+            "tool_name": "update_loan_result",
             "success": False,
             "user_id": payload.get("user_id", 1),
             "updated_plan_id": None,
             "error": str(e),
         }
-        
-# 4. user + plan + loan_product 통합 조회
+
+
+# 4. user + plan + loan_product 통합 조회 (DSR/DTI 포함)
 @router.post(
     "/get_user_loan_overview",
     summary="사용자 + 플랜 + 대출상품 통합 정보 조회",
@@ -324,6 +353,7 @@ async def update_loan_result(payload: Dict[str, Any] = Body(...)) -> dict:
         "출력(user_loan_info):\n"
         "- user_name, salary, income_usage_ratio\n"
         "- initial_prop, hope_price, loan_amount\n"
+        "- dsr, dti\n"
         "- product_id, product_name, product_summary"
     ),
     response_model=dict,
@@ -342,6 +372,8 @@ async def api_get_user_loan_overview(
                     m.income_usage_ratio,
                     m.initial_prop,
                     m.hope_price,
+                    m.dsr,
+                    m.dti,
                     p.loan_amount,
                     p.product_id,
                     l.product_name,
@@ -357,13 +389,15 @@ async def api_get_user_loan_overview(
 
             if not row:
                 return {
+                    "tool_name": "get_user_loan_overview",
                     "success": False,
                     "error": f"user_id={user_id} 의 정보를 찾을 수 없습니다.",
                     "user_loan_info": None,
                 }
 
-            # product_name이 비어 있고 product_id만 있는 경우 보정
             data = dict(row)
+
+            # product_name이 비어 있고 product_id만 있는 경우 보정
             if not data.get("product_name") and data.get("product_id"):
                 extra = conn.execute(
                     text("""
@@ -379,6 +413,7 @@ async def api_get_user_loan_overview(
                     data["product_summary"] = extra["summary"]
 
         return {
+            "tool_name": "get_user_loan_overview",
             "success": True,
             "user_loan_info": data,
         }
@@ -386,6 +421,7 @@ async def api_get_user_loan_overview(
     except Exception as e:
         logger.error(f"get_user_loan_overview Error: {e}", exc_info=True)
         return {
+            "tool_name": "get_user_loan_overview",
             "success": False,
             "error": str(e),
             "user_loan_info": None,
@@ -436,6 +472,7 @@ async def api_update_shortage_amount(
         )
 
         return {
+            "tool_name": "update_shortage_amount",
             "success": True,
             "user_id": user_id,
             "shortage_amount": shortage,
@@ -444,6 +481,7 @@ async def api_update_shortage_amount(
     except Exception as e:
         logger.error(f"update_shortage_amount Error: {e}", exc_info=True)
         return {
+            "tool_name": "update_shortage_amount",
             "success": False,
             "user_id": payload.get("user_id", 1),
             "shortage_amount": 0,
@@ -478,6 +516,7 @@ async def api_save_summary_report(
 
         if not summary_report:
             return {
+                "tool_name": "save_summary_report",
                 "success": False,
                 "user_id": user_id,
                 "error": "summary_report 내용이 비어 있습니다.",
@@ -495,6 +534,7 @@ async def api_save_summary_report(
 
             if not plan_id:
                 return {
+                    "tool_name": "save_summary_report",
                     "success": False,
                     "user_id": user_id,
                     "error": f"user_id={user_id} 의 플랜 정보를 찾을 수 없습니다.",
@@ -512,6 +552,7 @@ async def api_save_summary_report(
 
         logger.info(f"✅ summary_report 저장 완료 (user_id={user_id}, plan_id={plan_id})")
         return {
+            "tool_name": "save_summary_report",
             "success": True,
             "user_id": user_id,
         }
@@ -519,6 +560,7 @@ async def api_save_summary_report(
     except Exception as e:
         logger.error(f"save_summary_report Error: {e}", exc_info=True)
         return {
+            "tool_name": "save_summary_report",
             "success": False,
             "user_id": payload.get("user_id", 1),
             "error": str(e),

@@ -7,6 +7,8 @@ from datetime import datetime
 from fastapi import APIRouter, Body
 from typing import Dict, Any, List, Optional
 
+import pandas as pd  # ✅ filter_top_savings_products에서 사용
+
 # 라우터 설정
 router = APIRouter(
     prefix="/input",  # API 엔드포인트 기본 경로
@@ -69,10 +71,19 @@ async def api_parse_currency(value: Any = Body(..., embed=True)) -> dict:
 
     try:
         parsed = _parse_korean_currency(value)
-        return {"success": True, "parsed": parsed}
+        return {
+            "tool_name": "parse_currency",
+            "success": True,
+            "parsed": parsed,
+        }
     except Exception as e:
         logger.exception("parse_currency 실패")
-        return {"success": False, "error": str(e), "parsed": 0}
+        return {
+            "tool_name": "parse_currency",
+            "success": False,
+            "error": str(e),
+            "parsed": 0,
+        }
 
 
 # 2. 헬스 체크 엔드포인트
@@ -93,10 +104,18 @@ async def api_parse_currency(value: Any = Body(..., embed=True)) -> dict:
 async def api_health() -> dict:
     try:
         llm_model = os.getenv("PLAN_LLM", "qwen3:8b")
-        return {"success": True, "llm_model": llm_model}
+        return {
+            "tool_name": "plan_health",
+            "success": True,
+            "llm_model": llm_model,
+        }
     except Exception as e:
         logger.exception("health 실패")
-        return {"success": False, "error": str(e)}
+        return {
+            "tool_name": "plan_health",
+            "success": False,
+            "error": str(e),
+        }
 
 
 # 3. 지역 정규화 Tool
@@ -126,10 +145,19 @@ async def normalize_location(location: str = Body(..., embed=True)) -> dict:
             "대구 수성구": "대구광역시 수성구",
         }
         normalized = mapping.get(location.strip(), location)
-        return {"success": True, "normalized": normalized}
+        return {
+            "tool_name": "normalize_location",
+            "success": True,
+            "normalized": normalized,
+        }
     except Exception as e:
         logger.error(f"normalize_location Error: {e}")
-        return {"success": False, "error": str(e), "normalized": location}
+        return {
+            "tool_name": "normalize_location",
+            "success": False,
+            "error": str(e),
+            "normalized": location,
+        }
 
 
 # 4. 퍼센트/비율 파싱 Tool
@@ -153,12 +181,25 @@ async def parse_ratio(value: str = Body(..., embed=True)) -> dict:
     """'30%' 또는 '20' 같은 입력을 정수 비율로 변환"""
     try:
         if not value:
-            return {"success": False, "ratio": 0}
+            return {
+                "tool_name": "parse_ratio",
+                "success": False,
+                "ratio": 0,
+            }
         ratio = int(str(value).replace("%", "").strip())
-        return {"success": True, "ratio": ratio}
+        return {
+            "tool_name": "parse_ratio",
+            "success": True,
+            "ratio": ratio,
+        }
     except Exception as e:
         logger.error(f"parse_ratio Error: {e}")
-        return {"success": False, "error": str(e), "ratio": 0}
+        return {
+            "tool_name": "parse_ratio",
+            "success": False,
+            "error": str(e),
+            "ratio": 0,
+        }
 
 
 # 5. 입력 검증 Tool (input + validation 통합)
@@ -209,7 +250,11 @@ async def validate_input_data(payload: Dict[str, Any] = Body(...)) -> dict:
         # 필드 누락 시 즉시 반환
         if result["missing_fields"]:
             result["status"] = "incomplete"
-            return result
+            return {
+                "tool_name": "validate_input_data",
+                "success": False,
+                **result,
+            }
 
         # 각 필드별 정규화 수행
         from fastapi.encoders import jsonable_encoder
@@ -228,11 +273,23 @@ async def validate_input_data(payload: Dict[str, Any] = Body(...)) -> dict:
             "income_usage_ratio": ratio.get("ratio", 0),
             "validation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
-        return result
+
+        return {
+            "tool_name": "validate_input_data",
+            "success": True,
+            **result,
+        }
 
     except Exception as e:
         logger.error(f"validate_input_data Error: {e}")
-        return {"status": "error", "message": str(e)}
+        return {
+            "tool_name": "validate_input_data",
+            "success": False,
+            "status": "error",
+            "message": str(e),
+            "data": {},
+            "missing_fields": [],
+        }
 
 
 # 6. 예·적금 Top3 필터링 Tool (CSV + 조건 필터링)
@@ -287,6 +344,7 @@ async def filter_top_savings_products(
             msg = f"CSV 파일을 찾을 수 없습니다: {csv_path}"
             logger.error(msg)
             return {
+                "tool_name": "filter_top_savings_products",
                 "success": False,
                 "error": msg,
                 "top_deposits": [],
@@ -300,6 +358,7 @@ async def filter_top_savings_products(
             msg = f"CSV 로드 실패 ({csv_path}): {e}"
             logger.error(msg)
             return {
+                "tool_name": "filter_top_savings_products",
                 "success": False,
                 "error": msg,
                 "top_deposits": [],
@@ -374,6 +433,7 @@ async def filter_top_savings_products(
             top_savings = []
 
         return {
+            "tool_name": "filter_top_savings_products",
             "success": True,
             "top_deposits": top_deposits,
             "top_savings": top_savings,
@@ -388,13 +448,14 @@ async def filter_top_savings_products(
     except Exception as e:
         logger.error(f"filter_top_savings_products Error: {e}", exc_info=True)
         return {
+            "tool_name": "filter_top_savings_products",
             "success": False,
             "error": str(e),
             "top_deposits": [],
             "top_savings": [],
         }
-        
-        
+
+
 # 7. 리스크 레벨별 예상 수익률 Top1만 뽑아주는 순수 Tool
 @router.post(
     "/select_top_by_risk",
@@ -506,6 +567,7 @@ async def select_top_funds_by_risk(
 
         if not funds:
             return {
+                "tool_name": "select_top_funds_by_risk",
                 "success": False,
                 "error": "펀드 데이터가 비어 있습니다.",
                 "recommendations": [],
@@ -548,6 +610,7 @@ async def select_top_funds_by_risk(
         )
 
         return {
+            "tool_name": "select_top_funds_by_risk",
             "success": True,
             "recommendations": recommendations,
             "meta": {
@@ -561,6 +624,7 @@ async def select_top_funds_by_risk(
     except FileNotFoundError as e:
         logger.error(f"select_top_funds_by_risk FileNotFoundError: {e}")
         return {
+            "tool_name": "select_top_funds_by_risk",
             "success": False,
             "error": str(e),
             "recommendations": [],
@@ -568,11 +632,12 @@ async def select_top_funds_by_risk(
     except Exception as e:
         logger.error(f"select_top_funds_by_risk Error: {e}", exc_info=True)
         return {
+            "tool_name": "select_top_funds_by_risk",
             "success": False,
             "error": str(e),
             "recommendations": [],
         }
-        
+
 
 # 8. 부족 자금(shortage_amount) 계산 Tool
 @router.post(
@@ -617,6 +682,7 @@ async def calc_shortage_amount(
         shortage = max(0, hope_price - (loan_amount + initial_prop))
 
         return {
+            "tool_name": "calc_shortage_amount",
             "success": True,
             "shortage_amount": shortage,
             "inputs": {
@@ -628,12 +694,13 @@ async def calc_shortage_amount(
     except Exception as e:
         logger.error(f"calc_shortage_amount Error: {e}", exc_info=True)
         return {
+            "tool_name": "calc_shortage_amount",
             "success": False,
             "error": str(e),
             "shortage_amount": 0,
         }
-        
-        
+
+
 # 9. 복리 기반 투자 시뮬레이션 Tool
 @router.post(
     "/simulate_investment",
@@ -760,6 +827,7 @@ async def simulate_investment(
         )
 
         return {
+            "tool_name": "simulate_combined_investment",
             "success": True,
             "simulation": simulation,
             "inputs": {
@@ -777,6 +845,7 @@ async def simulate_investment(
     except Exception as e:
         logger.error(f"simulate_investment Error: {e}", exc_info=True)
         return {
+            "tool_name": "simulate_combined_investment",
             "success": False,
             "error": str(e),
             "simulation": None,

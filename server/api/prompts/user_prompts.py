@@ -1,4 +1,4 @@
-from server.tools.user_tools import USERS_DB
+from server.api.tools.user_tools import USERS_DB
 
 async def user_greeting(user_name: str) -> str:
     return f"안녕하세요 {user_name}님! 무엇을 도와드릴까요?"
