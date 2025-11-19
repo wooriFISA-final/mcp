@@ -6,8 +6,35 @@ import logging
 from datetime import datetime
 from fastapi import APIRouter, Body
 from typing import Dict, Any, List, Optional
+from langchain_community.vectorstores import FAISS
+from langchain_core.embeddings import Embeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 
+from langchain_ollama import OllamaEmbeddings
 import pandas as pd  # ✅ filter_top_savings_products에서 사용
+
+# 🔹 스키마 임포트
+from server.schemas.plan_schema import (
+    ParseCurrencyRequest,
+    ParseCurrencyResponse,
+    HealthResponse,
+    NormalizeLocationRequest,
+    NormalizeLocationResponse,
+    ParseRatioRequest,
+    ParseRatioResponse,
+    ValidateInputRequest,
+    ValidateInputResponse,
+    SelectTopFundsByRiskRequest,
+    SelectTopFundsByRiskResponse,
+    CalcShortageAmountRequest,
+    CalcShortageAmountResponse,
+    SimulateInvestmentRequest,
+    SimulateInvestmentResponse,
+    GetSavingsCandidatesRequest,
+    GetSavingsCandidatesResponse,
+    RecommendSavingsProductsRequest,
+    RecommendSavingsProductsResponse,
+)
 
 # 라우터 설정
 router = APIRouter(
@@ -16,6 +43,105 @@ router = APIRouter(
 )
 
 logger = logging.getLogger(__name__)
+
+_embeddings: Optional[Embeddings] = None  # 전역 캐시
+
+# ==========================================
+# 🔹 FAISS 예/적금 인덱스 로더
+#    - faiss_deposit_products / faiss_saving_products
+#    - 각 폴더에 index.faiss + index.pkl 있다고 가정
+# ==========================================
+BASE_DIR = Path(__file__).resolve().parents[2]
+FAISS_DEPOSIT_DIR = BASE_DIR / "faiss_deposit_products"
+FAISS_SAVING_DIR = BASE_DIR / "faiss_saving_products"
+
+# 전역 캐시
+_deposit_store: Optional[FAISS] = None
+_saving_store: Optional[FAISS] = None
+_embeddings: Optional[OllamaEmbeddings] = None
+
+
+def _get_embeddings() -> Embeddings:
+    """
+    ⚠️ 중요: FAISS 인덱스를 만들 때 사용한 임베딩 모델과 동일해야 함.
+    여기서는 Hugging Face Inference API의 Qwen/Qwen3-Embedding-8B 사용.
+    """
+    global _embeddings
+    if _embeddings is None:
+        embed_model = os.getenv("EMBED_MODEL", "Qwen/Qwen3-Embedding-8B")
+        hf_token = os.getenv("HF_TOKEN")
+
+        if not hf_token:
+            raise RuntimeError(
+                "HF_TOKEN 이 설정되어 있지 않습니다. "
+                ".env 에 토큰을 추가하거나 환경변수로 설정하세요."
+            )
+
+        _embeddings = HuggingFaceEndpointEmbeddings(
+            model=embed_model,
+            task="feature-extraction",         # HF 임베딩 엔드포인트 기본 태스크
+            huggingfacehub_api_token=hf_token,
+        )
+
+        logger.info(f"✅ HF Embeddings 로드 완료: {embed_model}")
+
+    return _embeddings
+
+
+def _get_faiss_store(kind: str) -> FAISS:
+    """
+    kind: 'deposit' | 'saving'
+    해당 폴더에서 index.faiss + index.pkl을 이용해 LangChain FAISS 로드
+    """
+    global _deposit_store, _saving_store
+
+    embeddings = _get_embeddings()
+
+    if kind == "deposit":
+        if _deposit_store is None:
+            logger.info(f"🔄 예금 FAISS 인덱스 로드: {FAISS_DEPOSIT_DIR}")
+            _deposit_store = FAISS.load_local(
+                str(FAISS_DEPOSIT_DIR),
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+        return _deposit_store
+
+    elif kind == "saving":
+        if _saving_store is None:
+            logger.info(f"🔄 적금 FAISS 인덱스 로드: {FAISS_SAVING_DIR}")
+            _saving_store = FAISS.load_local(
+                str(FAISS_SAVING_DIR),
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+        return _saving_store
+
+    else:
+        raise ValueError(f"Unknown FAISS kind: {kind}")
+
+
+def _build_user_profile_text(user_data: Dict[str, Any]) -> str:
+    """
+    사용자 프로필(dict)을 자연어 텍스트로 변환해서 검색 질의로 사용.
+    인덱스를 만들 때 '상품 설명' 기준으로 임베딩했을 것이므로,
+    여기서는 '어떤 사람이 어떤 목적의 상품을 찾는지'를 묘사해 준다는 느낌.
+    """
+    age = user_data.get("age")
+    salary = user_data.get("salary")
+    invest_tendency = user_data.get("invest_tendency") or user_data.get("risk_type")
+    goal = user_data.get("goal") or user_data.get("purpose") or "주택 자금 마련"
+
+    parts = []
+    if age:
+        parts.append(f"{age}세")
+    if salary:
+        parts.append(f"연봉 {salary}원")
+    if invest_tendency:
+        parts.append(f"투자 성향은 {invest_tendency}")
+    parts.append(goal)
+    # 예: "29세, 연봉 42000000원, 투자 성향은 안정형, 주택 자금 마련"
+    return ", ".join(parts)
 
 
 # 1. 금액 파싱 Tool
@@ -29,9 +155,11 @@ logger = logging.getLogger(__name__)
         "- '3억 5천만' → 350000000\n"
         "- '1200만' → 12000000"
     ),
-    response_model=dict,
+    response_model=ParseCurrencyResponse,
 )
-async def api_parse_currency(value: Any = Body(..., embed=True)) -> dict:
+async def api_parse_currency(
+    req: ParseCurrencyRequest = Body(...),
+) -> ParseCurrencyResponse:
     # 엔드포인트 내부에 파서 함수를 중첩 정의
     def _parse_korean_currency(v: Any) -> int:
         """'3억 5천' 같은 금액 표현을 정수(원)로 변환"""
@@ -70,20 +198,19 @@ async def api_parse_currency(value: Any = Body(..., embed=True)) -> dict:
         return int(total)
 
     try:
-        parsed = _parse_korean_currency(value)
-        return {
-            "tool_name": "parse_currency",
-            "success": True,
-            "parsed": parsed,
-        }
+        parsed = _parse_korean_currency(req.value)
+        return ParseCurrencyResponse(
+            success=True,
+            parsed=parsed,
+            error=None,
+        )
     except Exception as e:
         logger.exception("parse_currency 실패")
-        return {
-            "tool_name": "parse_currency",
-            "success": False,
-            "error": str(e),
-            "parsed": 0,
-        }
+        return ParseCurrencyResponse(
+            success=False,
+            parsed=0,
+            error=str(e),
+        )
 
 
 # 2. 헬스 체크 엔드포인트
@@ -99,23 +226,23 @@ async def api_parse_currency(value: Any = Body(..., embed=True)) -> dict:
         "응답 예시:\n"
         '{"success": true, "llm_model": "qwen3:8b"}'
     ),
-    response_model=dict,
+    response_model=HealthResponse,
 )
-async def api_health() -> dict:
+async def api_health() -> HealthResponse:
     try:
         llm_model = os.getenv("PLAN_LLM", "qwen3:8b")
-        return {
-            "tool_name": "plan_health",
-            "success": True,
-            "llm_model": llm_model,
-        }
+        return HealthResponse(
+            success=True,
+            llm_model=llm_model,
+            error=None,
+        )
     except Exception as e:
         logger.exception("health 실패")
-        return {
-            "tool_name": "plan_health",
-            "success": False,
-            "error": str(e),
-        }
+        return HealthResponse(
+            success=False,
+            llm_model=None,
+            error=str(e),
+        )
 
 
 # 3. 지역 정규화 Tool
@@ -132,9 +259,11 @@ async def api_health() -> dict:
         "- '서울 동작구' → '서울특별시 동작구'\n"
         "- '부산 해운대구' → '부산광역시 해운대구'"
     ),
-    response_model=dict,
+    response_model=NormalizeLocationResponse,
 )
-async def normalize_location(location: str = Body(..., embed=True)) -> dict:
+async def normalize_location(
+    req: NormalizeLocationRequest = Body(...),
+) -> NormalizeLocationResponse:
     """간단한 지역명 매핑"""
     try:
         mapping = {
@@ -144,20 +273,19 @@ async def normalize_location(location: str = Body(..., embed=True)) -> dict:
             "부산 해운대구": "부산광역시 해운대구",
             "대구 수성구": "대구광역시 수성구",
         }
-        normalized = mapping.get(location.strip(), location)
-        return {
-            "tool_name": "normalize_location",
-            "success": True,
-            "normalized": normalized,
-        }
+        normalized = mapping.get(req.location.strip(), req.location)
+        return NormalizeLocationResponse(
+            success=True,
+            normalized=normalized,
+            error=None,
+        )
     except Exception as e:
         logger.error(f"normalize_location Error: {e}")
-        return {
-            "tool_name": "normalize_location",
-            "success": False,
-            "error": str(e),
-            "normalized": location,
-        }
+        return NormalizeLocationResponse(
+            success=False,
+            normalized=req.location,
+            error=str(e),
+        )
 
 
 # 4. 퍼센트/비율 파싱 Tool
@@ -175,31 +303,32 @@ async def normalize_location(location: str = Body(..., embed=True)) -> dict:
         "- success: 처리 성공 여부(Boolean)\n"
         "- ratio: 정수 비율 값"
     ),
-    response_model=dict,
+    response_model=ParseRatioResponse,
 )
-async def parse_ratio(value: str = Body(..., embed=True)) -> dict:
+async def parse_ratio(
+    req: ParseRatioRequest = Body(...),
+) -> ParseRatioResponse:
     """'30%' 또는 '20' 같은 입력을 정수 비율로 변환"""
     try:
-        if not value:
-            return {
-                "tool_name": "parse_ratio",
-                "success": False,
-                "ratio": 0,
-            }
-        ratio = int(str(value).replace("%", "").strip())
-        return {
-            "tool_name": "parse_ratio",
-            "success": True,
-            "ratio": ratio,
-        }
+        if not req.value:
+            return ParseRatioResponse(
+                success=False,
+                ratio=0,
+                error=None,
+            )
+        ratio = int(str(req.value).replace("%", "").strip())
+        return ParseRatioResponse(
+            success=True,
+            ratio=ratio,
+            error=None,
+        )
     except Exception as e:
         logger.error(f"parse_ratio Error: {e}")
-        return {
-            "tool_name": "parse_ratio",
-            "success": False,
-            "error": str(e),
-            "ratio": 0,
-        }
+        return ParseRatioResponse(
+            success=False,
+            ratio=0,
+            error=str(e),
+        )
 
 
 # 5. 입력 검증 Tool (input + validation 통합)
@@ -221,20 +350,18 @@ async def parse_ratio(value: str = Body(..., embed=True)) -> dict:
         "- data: 정규화된 결과 (success일 때)\n"
         "- missing_fields: 누락된 필드 목록 (incomplete일 때)"
     ),
-    response_model=dict,
+    response_model=ValidateInputResponse,
 )
-async def validate_input_data(payload: Dict[str, Any] = Body(...)) -> dict:
+async def validate_input_data(
+    payload: ValidateInputRequest = Body(...),
+) -> ValidateInputResponse:
     """
     전체 입력 데이터의 누락 필드를 검사하고,
     금액·비율·지역 정보를 표준화하여 반환.
     """
     try:
-        data = payload.get("data", {})
-        result = {
-            "status": "success",
-            "data": {},
-            "missing_fields": [],
-        }
+        data = payload.data
+        result_missing: List[str] = []
 
         # 필수 입력 필드 정의
         required_fields = [
@@ -245,54 +372,57 @@ async def validate_input_data(payload: Dict[str, Any] = Body(...)) -> dict:
         for field in required_fields:
             value = data.get(field)
             if value in [None, "", 0, "0"]:
-                result["missing_fields"].append(field)
+                result_missing.append(field)
 
         # 필드 누락 시 즉시 반환
-        if result["missing_fields"]:
-            result["status"] = "incomplete"
-            return {
-                "tool_name": "validate_input_data",
-                "success": False,
-                **result,
-            }
+        if result_missing:
+            return ValidateInputResponse(
+                success=False,
+                status="incomplete",
+                data=None,
+                missing_fields=result_missing,
+                message=None,
+            )
 
         # 각 필드별 정규화 수행
         from fastapi.encoders import jsonable_encoder
 
-        cur1 = await api_parse_currency(data.get("initial_prop", "0"))
-        cur2 = await api_parse_currency(data.get("hope_price", "0"))
-        ratio = await parse_ratio(data.get("income_usage_ratio", "0"))
-        loc = await normalize_location(data.get("hope_location", ""))
+        cur1 = await api_parse_currency(ParseCurrencyRequest(value=data.get("initial_prop", "0")))
+        cur2 = await api_parse_currency(ParseCurrencyRequest(value=data.get("hope_price", "0")))
+        ratio = await parse_ratio(ParseRatioRequest(value=data.get("income_usage_ratio", "0")))
+        loc = await normalize_location(NormalizeLocationRequest(location=data.get("hope_location", "")))
 
         # 정규화 완료된 결과 구성
-        result["data"] = jsonable_encoder({
-            "initial_prop": cur1.get("parsed", 0),
-            "hope_location": loc.get("normalized", data.get("hope_location", "")),
-            "hope_price": cur2.get("parsed", 0),
+        normalized_data = jsonable_encoder({
+            "initial_prop": cur1.parsed,
+            "hope_location": loc.normalized,
+            "hope_price": cur2.parsed,
             "hope_housing_type": data.get("hope_housing_type"),
-            "income_usage_ratio": ratio.get("ratio", 0),
+            "income_usage_ratio": ratio.ratio,
             "validation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         })
 
-        return {
-            "tool_name": "validate_input_data",
-            "success": True,
-            **result,
-        }
+        return ValidateInputResponse(
+            success=True,
+            status="success",
+            data=normalized_data,
+            missing_fields=[],
+            message=None,
+        )
 
     except Exception as e:
         logger.error(f"validate_input_data Error: {e}")
-        return {
-            "tool_name": "validate_input_data",
-            "success": False,
-            "status": "error",
-            "message": str(e),
-            "data": {},
-            "missing_fields": [],
-        }
+        return ValidateInputResponse(
+            success=False,
+            status="error",
+            data=None,
+            missing_fields=[],
+            message=str(e),
+        )
 
 
 # 6. 예·적금 Top3 필터링 Tool (CSV + 조건 필터링)
+# ➜ plan_schema.py에 Request/Response 정의가 안 보였으니까 일단 dict 유지
 @router.post(
     "/filter_top_products",
     summary="예·적금 Top3 상품 필터링",
@@ -464,28 +594,13 @@ async def filter_top_savings_products(
     description=(
         "펀드 원시 데이터(Raw Fund Data)를 입력받아, "
         "`risk_level`별로 `expected_return`(예상 수익률)이 가장 높은 상품을 "
-        "**각각 1개씩** 선별하여 반환합니다.\n\n"
-        "입력 방법은 두 가지 중 하나입니다.\n"
-        "1) fund_data (권장):\n"
-        '   - body.fund_data 에 펀드 목록 리스트를 직접 전달\n'
-        "2) fund_data_path:\n"
-        "   - body.fund_data_path 에 JSON 파일 경로를 전달\n"
-        "   - 미지정 시 기본 경로(fund_data.json)를 사용합니다.\n\n"
-        "각 펀드 항목 예시 필드:\n"
-        "- risk_level: '높은 위험', '중간 위험', '낮은 위험' 등\n"
-        "- product_name (또는 name): 상품명\n"
-        "- expected_return: '12.5%' 또는 10.0 등\n"
-        "- description: 상품 설명\n\n"
-        "출력 필드:\n"
-        "- success: 처리 성공 여부(Boolean)\n"
-        "- recommendations: 리스크 레벨별 Top1 펀드 목록\n"
-        "- meta: 사용된 데이터 개수 등 부가 정보"
+        "**각각 1개씩** 선별하여 반환합니다."
     ),
-    response_model=dict,
+    response_model=SelectTopFundsByRiskResponse,
 )
 async def select_top_funds_by_risk(
-    payload: Dict[str, Any] = Body(...)
-) -> dict:
+    payload: SelectTopFundsByRiskRequest = Body(...),
+) -> SelectTopFundsByRiskResponse:
     """
     리스크 레벨별로 예상 수익률이 가장 높은 펀드 상품을 1개씩 선별하는 Tool.
     (LLM, LangGraph 사용 X / 순수 파이썬 로직만 사용)
@@ -559,19 +674,19 @@ async def select_top_funds_by_risk(
             return 0.0
 
     try:
-        fund_data_in_body: Optional[List[Dict[str, Any]]] = payload.get("fund_data")
-        fund_data_path: Optional[str] = payload.get("fund_data_path")
+        fund_data_in_body = payload.fund_data
+        fund_data_path = payload.fund_data_path
 
         # 1) 데이터 로드
         funds = _load_fund_data(fund_data_in_body, fund_data_path)
 
         if not funds:
-            return {
-                "tool_name": "select_top_funds_by_risk",
-                "success": False,
-                "error": "펀드 데이터가 비어 있습니다.",
-                "recommendations": [],
-            }
+            return SelectTopFundsByRiskResponse(
+                success=False,
+                recommendations=[],
+                meta=None,
+                error="펀드 데이터가 비어 있습니다.",
+            )
 
         # 2) risk_level 그룹별 최고 expected_return 상품 선별
         best_by_risk: Dict[str, Dict[str, Any]] = {}
@@ -609,34 +724,34 @@ async def select_top_funds_by_risk(
             reverse=True,
         )
 
-        return {
-            "tool_name": "select_top_funds_by_risk",
-            "success": True,
-            "recommendations": recommendations,
-            "meta": {
+        return SelectTopFundsByRiskResponse(
+            success=True,
+            recommendations=recommendations,
+            meta={
                 "total_input_funds": len(funds),
                 "unique_risk_levels": len(best_by_risk),
                 "source": "fund_data_in_body" if fund_data_in_body else "fund_data_path",
                 "fund_data_path": fund_data_path,
             },
-        }
+            error=None,
+        )
 
     except FileNotFoundError as e:
         logger.error(f"select_top_funds_by_risk FileNotFoundError: {e}")
-        return {
-            "tool_name": "select_top_funds_by_risk",
-            "success": False,
-            "error": str(e),
-            "recommendations": [],
-        }
+        return SelectTopFundsByRiskResponse(
+            success=False,
+            recommendations=[],
+            meta=None,
+            error=str(e),
+        )
     except Exception as e:
         logger.error(f"select_top_funds_by_risk Error: {e}", exc_info=True)
-        return {
-            "tool_name": "select_top_funds_by_risk",
-            "success": False,
-            "error": str(e),
-            "recommendations": [],
-        }
+        return SelectTopFundsByRiskResponse(
+            success=False,
+            recommendations=[],
+            meta=None,
+            error=str(e),
+        )
 
 
 # 8. 부족 자금(shortage_amount) 계산 Tool
@@ -646,21 +761,13 @@ async def select_top_funds_by_risk(
     operation_id="calc_shortage_amount",
     description=(
         "희망 주택 가격, 예상 대출 금액, 보유 자산을 입력받아 "
-        "**부족 자금(Shortage Amount)** 을 계산합니다.\n\n"
-        "계산식:\n"
-        "- shortage_amount = max(0, hope_price - (loan_amount + initial_prop))\n\n"
-        "입력 예시:\n"
-        "- hope_price: 800000000  (희망 주택 가격)\n"
-        "- loan_amount: 400000000 (예상 대출 금액)\n"
-        "- initial_prop: 200000000 (보유 자산)\n\n"
-        "출력:\n"
-        "- shortage_amount: 200000000"
+        "**부족 자금(Shortage Amount)** 을 계산합니다."
     ),
-    response_model=dict,
+    response_model=CalcShortageAmountResponse,
 )
 async def calc_shortage_amount(
-    payload: Dict[str, Any] = Body(...)
-) -> dict:
+    payload: CalcShortageAmountRequest = Body(...),
+) -> CalcShortageAmountResponse:
     """
     희망 주택 가격, 대출 금액, 보유 자산을 기반으로 부족 자금을 계산하는 Tool.
     (DB 업데이트 없음, 순수 계산 전용)
@@ -675,30 +782,30 @@ async def calc_shortage_amount(
             return 0
 
     try:
-        hope_price = _to_int(payload.get("hope_price"))
-        loan_amount = _to_int(payload.get("loan_amount"))
-        initial_prop = _to_int(payload.get("initial_prop"))
+        hope_price = _to_int(payload.hope_price)
+        loan_amount = _to_int(payload.loan_amount)
+        initial_prop = _to_int(payload.initial_prop)
 
         shortage = max(0, hope_price - (loan_amount + initial_prop))
 
-        return {
-            "tool_name": "calc_shortage_amount",
-            "success": True,
-            "shortage_amount": shortage,
-            "inputs": {
+        return CalcShortageAmountResponse(
+            success=True,
+            shortage_amount=shortage,
+            inputs={
                 "hope_price": hope_price,
                 "loan_amount": loan_amount,
                 "initial_prop": initial_prop,
             },
-        }
+            error=None,
+        )
     except Exception as e:
         logger.error(f"calc_shortage_amount Error: {e}", exc_info=True)
-        return {
-            "tool_name": "calc_shortage_amount",
-            "success": False,
-            "error": str(e),
-            "shortage_amount": 0,
-        }
+        return CalcShortageAmountResponse(
+            success=False,
+            shortage_amount=0,
+            inputs=None,
+            error=str(e),
+        )
 
 
 # 9. 복리 기반 투자 시뮬레이션 Tool
@@ -707,32 +814,13 @@ async def calc_shortage_amount(
     summary="복리 기반 투자 시뮬레이션",
     operation_id="simulate_combined_investment",
     description=(
-        "부족 자금을 채우기 위한 **예금/적금 + 펀드** 복합 투자 시뮬레이션을 수행합니다.\n\n"
-        "입력값:\n"
-        "- shortage: 채워야 할 부족 금액 (원 단위)\n"
-        "- available_assets: 현재 투자에 투입 가능한 자산 (원 단위)\n"
-        "- monthly_income: 월 소득 (원 단위)\n"
-        "- income_usage_ratio: 월 소득 중 투자에 사용할 비율 (%)\n"
-        "- saving_yield: 예금/적금 연 수익률 (%)\n"
-        "- fund_yield: 펀드 연 수익률 (%)\n"
-        "- saving_ratio: 투자 비중 중 예금/적금 비율 (0~1)\n"
-        "- fund_ratio: 투자 비중 중 펀드 비율 (0~1)\n\n"
-        "계산 방식(요약):\n"
-        "- 초기 자산을 saving_ratio / fund_ratio 비율로 나눠 각각 투자\n"
-        "- 매월 투자금 = monthly_income × (income_usage_ratio / 100)\n"
-        "- 매월 예금/적금·펀드 각각에 비율대로 적립 + 월복리 적용\n"
-        "- 총 자산이 shortage 이상이 되는 시점까지 최대 600개월(50년) 반복\n\n"
-        "출력값(simulation):\n"
-        "- months_needed: 부족금 달성까지 필요한 개월 수 (최대 600)\n"
-        "- total_balance: 시뮬레이션 종료 시점의 총 자산\n"
-        "- monthly_invest: 매월 투자 금액\n"
-        "- saving_ratio, fund_ratio: 사용된 비중(그대로 반환)"
+        "부족 자금을 채우기 위한 **예금/적금 + 펀드** 복합 투자 시뮬레이션을 수행합니다."
     ),
-    response_model=dict,
+    response_model=SimulateInvestmentResponse,
 )
 async def simulate_investment(
-    payload: Dict[str, Any] = Body(...)
-) -> dict:
+    payload: SimulateInvestmentRequest = Body(...),
+) -> SimulateInvestmentResponse:
     """
     예금/적금 + 펀드 복합 투자를 단순 월복리 모델로 시뮬레이션하는 Tool.
     (DB / LLM 사용 없음)
@@ -804,16 +892,16 @@ async def simulate_investment(
         }
 
     try:
-        shortage = _to_int(payload.get("shortage"), 0)
-        available_assets = _to_int(payload.get("available_assets"), 0)
-        monthly_income = _to_float(payload.get("monthly_income"), 0.0)
-        income_usage_ratio = _to_float(payload.get("income_usage_ratio"), 20.0)
+        shortage = _to_int(payload.shortage, 0)
+        available_assets = _to_int(payload.available_assets, 0)
+        monthly_income = _to_float(payload.monthly_income, 0.0)
+        income_usage_ratio = _to_float(payload.income_usage_ratio, 20.0)
 
-        saving_yield = _to_float(payload.get("saving_yield"), 3.0)
-        fund_yield = _to_float(payload.get("fund_yield"), 6.0)
+        saving_yield = _to_float(payload.saving_yield, 3.0)
+        fund_yield = _to_float(payload.fund_yield, 6.0)
 
-        saving_ratio = _to_float(payload.get("saving_ratio"), 0.5)
-        fund_ratio = _to_float(payload.get("fund_ratio"), 0.5)
+        saving_ratio = _to_float(payload.saving_ratio, 0.5)
+        fund_ratio = _to_float(payload.fund_ratio, 0.5)
 
         simulation = _simulate(
             shortage=shortage,
@@ -826,11 +914,10 @@ async def simulate_investment(
             fund_ratio=fund_ratio,
         )
 
-        return {
-            "tool_name": "simulate_combined_investment",
-            "success": True,
-            "simulation": simulation,
-            "inputs": {
+        return SimulateInvestmentResponse(
+            success=True,
+            simulation=simulation,
+            inputs={
                 "shortage": shortage,
                 "available_assets": available_assets,
                 "monthly_income": monthly_income,
@@ -840,13 +927,14 @@ async def simulate_investment(
                 "saving_ratio": saving_ratio,
                 "fund_ratio": fund_ratio,
             },
-        }
+            error=None,
+        )
 
     except Exception as e:
         logger.error(f"simulate_investment Error: {e}", exc_info=True)
-        return {
-            "tool_name": "simulate_combined_investment",
-            "success": False,
-            "error": str(e),
-            "simulation": None,
-        }
+        return SimulateInvestmentResponse(
+            success=False,
+            simulation=None,
+            inputs=None,
+            error=str(e),
+        )
