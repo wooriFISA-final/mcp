@@ -1,6 +1,3 @@
-# ============================================
-# main.py (FastAPI + FastMCP Streamable-HTTP)
-# ============================================
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from config.logger import get_logger

@@ -47,4 +47,3 @@ async def get_user(request:UserGetRequest) -> dict:
     if request.name not in USERS_DB:
         return {"success": False, "error": f"User {request.name} not found", "user": None}
     return {"tool_name": "get_user", "success": True, "user": USERS_DB[request.name]}
-
