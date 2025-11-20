@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import re
 import logging
+import pandas as pd
 from datetime import datetime
 from fastapi import APIRouter, Body
 from typing import Dict, Any, List, Optional
