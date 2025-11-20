@@ -666,3 +666,279 @@ async def api_add_my_product(
             product_id=None,
             error=str(e),
         )
+
+# 사용자 투자 성향 조회
+@router.post(
+    "/get_user_profile_for_fund",
+    summary="사용자 투자 성향 조회",
+    operation_id="get_user_profile_for_fund",
+    description=(
+        "members 테이블에서 user_id를 기준으로 사용자의 투자 성향(invest_tendency)을 조회합니다.\n\n"
+        "입력 필드 예시:\n"
+        "- user_id: 사용자 ID (숫자 또는 문자열)\n\n"
+        "출력 필드:\n"
+        "- success: 조회 성공 여부(Boolean)\n"
+        "- user_id: 조회된 사용자 ID\n"
+        "- invest_tendency: 투자 성향 (값이 없으면 에러 반환)\n"
+        "- error: 오류 메시지(실패 시)"
+    ),
+    response_model=dict,
+)
+async def api_get_user_profile_for_fund(
+    payload: Dict[str, Any] = Body(...)
+) -> dict:
+    """
+    members 테이블에서 사용자의 투자 성향을 조회하는 Tool.
+    """
+    user_id = payload.get("user_id")
+
+    # 1. 입력값 검증
+    if not user_id:
+        return {
+            "tool_name": "get_user_profile_for_fund",
+            "success": False,
+            "error": "입력값에 'user_id'가 누락되었습니다.",
+        }
+
+    try:
+        with engine.connect() as conn:
+            # 2. DB 조회
+            query = text("""
+                SELECT user_name, age, invest_tendency
+                FROM members
+                WHERE user_id = :uid
+                LIMIT 1
+            """)
+            result = conn.execute(query, {"uid": user_id}).fetchone()
+            
+            # 3. 결과 검증
+            if not result:
+                # (Case A) 해당 user_id가 DB에 없는 경우
+                return {
+                    "tool_name": "get_user_profile_for_fund",
+                    "success": False,
+                    "error": f"ID가 '{user_id}'인 사용자를 찾을 수 없습니다."
+                }
+            
+            user_name, age, invest_tendency = result
+            
+            if not invest_tendency:
+                # (Case B) 사용자는 있는데 투자 성향이 NULL/빈 값인 경우
+                # -> 펀드 추천 불가능하므로 에러 반환
+                return {
+                    "tool_name": "get_user_profile_for_fund",
+                    "success": False,
+                    "error": f"사용자('{user_name}')의 투자 성향 정보가 없습니다. 먼저 투자 성향 분석을 진행해주세요."
+                }
+
+            # 4. 성공 시 정보 반환
+            return {
+                "tool_name": "get_user_profile_for_fund",
+                "success": True,
+                "user_id": user_id,
+                "user_name": user_name,
+                "age": age,
+                "invest_tendency": invest_tendency
+            }
+
+    except Exception as e:
+        logger.error(f"get_user_profile_for_fund Error: {e}", exc_info=True)
+        return {
+            "tool_name": "get_user_profile_for_fund",
+            "success": False,
+            "error": f"DB 조회 중 오류 발생: {str(e)}",
+        }
+
+# 사용자 투자성향 조회 후 최종품질종합점수 TOP2 조회
+@router.post(
+    "/get_ml_ranked_funds",
+    summary="투자성향별 ML 펀드 랭킹 조회",
+    operation_id="get_ml_ranked_funds",
+    description=(
+        "사용자의 투자 성향(invest_tendency)을 입력받아, "
+        "허용된 위험 등급별로 '최종_종합품질점수'가 가장 높은 상위 2개 펀드를 조회합니다."
+    ),
+    response_model=dict,
+)
+async def api_get_ml_ranked_funds(
+    payload: Dict[str, Any] = Body(...)
+) -> dict:
+    """
+    DB의 fund_ranking_snapshot 테이블에서 성향에 맞는 펀드를 조회하는 Tool.
+    """
+    # 1. 입력값 검증
+    invest_tendency = payload.get("invest_tendency")
+    
+    if not invest_tendency:
+        return {
+            "tool_name": "get_ml_ranked_funds",
+            "success": False,
+            "funds": [],
+            "error": "입력값에 'invest_tendency'(투자성향)가 누락되었습니다."
+        }
+    
+    # [설정] 투자 성향별 허용 등급 매핑
+    investor_style_to_grades = {
+        '공격투자형': ["매우 높은 위험", "높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
+        '적극투자형': ["매우 높은 위험", "높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험"],
+        '위험중립형': ["높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험"],
+        '안정추구형': ["다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
+        '안정형': ["보통 위험", "낮은 위험", "매우 낮은 위험"]
+    }
+    
+    # 2. 허용 등급 확인 (기본값 제거)
+    # 사용자의 입력값(invest_tendency)이 딕셔너리 키에 있는지 확인
+    if invest_tendency not in investor_style_to_grades:
+        #매핑되지 않는 성향이 들어오면 에러 반환 (Fail-Fast)
+        return {
+            "tool_name": "get_ml_ranked_funds",
+            "success": False,
+            "funds": [],
+            "error": f"유효하지 않은 투자 성향입니다: '{invest_tendency}' (허용된 값: {list(investor_style_to_grades.keys())})"
+        }
+
+    # 유효한 경우에만 가져옴
+    allowed_risks = investor_style_to_grades[invest_tendency]
+    
+    try:
+        # 3. DB에서 데이터 조회
+        query = "SELECT * FROM fund_ranking_snapshot"
+        df = pd.read_sql(query, engine)
+        
+        if df.empty:
+             return {
+                 "tool_name": "get_ml_ranked_funds", 
+                 "success": False, 
+                 "funds": [],
+                 "error": "펀드 데이터베이스가 비어 있습니다."
+             }
+
+
+        df['risk_normalized'] = df['위험등급'].astype(str).str.replace(" ", "").str.strip()
+
+        final_list = []
+        
+        # 4. 각 허용 등급별로 Top 2 선별
+        for risk in allowed_risks:
+            search_key = risk.replace(" ", "").strip()
+
+            group_df = df[df['risk_normalized'] == search_key].sort_values(
+                by='최종_종합품질점수', ascending=False
+            ).head(2)
+            
+            for _, row in group_df.iterrows():
+                fund_data = {
+                    "product_name": row['펀드명'],
+                    "risk_level": row['위험등급'],
+                    "final_quality_score": round(row['최종_종합품질점수'], 2),
+                    "perf_score": round(row['종합_성과_점수'], 2),    
+                    "stab_score": round(row['종합_안정성_점수'], 2),
+                    "description": str(row.get('설명', ''))[:500] + "..." if row.get('설명') else "설명 없음",
+                    "evidence": {
+                        "return_1y": row.get('1년_수익률', 0),
+                        "return_3m": row.get('3개월_수익률', 0),
+                        "total_fee": row.get('총보수(%)', 0),
+                        "fund_size": row.get('운용_규모(억)', 0),
+                        "volatility_1y": row.get('1년_변동성', 0),
+                        "mdd_1y": row.get('최대_손실_낙폭(MDD)', 0)
+                    }
+                }
+                final_list.append(fund_data)
+        
+        if not final_list:
+            return {
+                "tool_name": "get_ml_ranked_funds",
+                "success": False, # 성공이 아님
+                "funds": [],
+                "error": f"성향('{invest_tendency}')에 맞는 펀드를 DB에서 찾을 수 없습니다."
+            }
+
+        logger.info(f"Invest tendency '{invest_tendency}' -> Found {len(final_list)} funds.")
+        
+        return {
+            "tool_name": "get_ml_ranked_funds",
+            "success": True,
+            "funds": final_list
+        }
+
+    except Exception as e:
+        logger.error(f"get_ml_ranked_funds Error: {e}", exc_info=True)
+        return {
+            "tool_name": "get_ml_ranked_funds",
+            "success": False,
+            "funds": [],
+            "error": str(e),
+        }
+
+
+# 4. 펀드 가입 처리 (my_products 테이블 적재)
+@router.post(
+    "/add_my_product",
+    summary="사용자 펀드 가입 처리",
+    operation_id="add_my_product",
+    description=(
+        "사용자가 선택한 펀드 상품을 'my_products' 테이블에 저장하여 가입 처리합니다.\n\n"
+        "입력 필드 예시:\n"
+        "- user_id: 사용자 ID (필수)\n"
+        "- product_name: 펀드 상품명 (필수)\n"
+        "- product_type: 상품 유형 (기본값: '펀드')\n"
+        "- product_description: 펀드 설명 (선택 사항)\n"
+    ),
+    response_model=dict,
+)
+async def api_add_my_product(
+    payload: Dict[str, Any] = Body(...)
+) -> dict:
+    """
+    사용자가 선택한 펀드를 my_products 테이블에 INSERT하는 Tool.
+    (필수 컬럼만 입력받아 처리합니다.)
+    """
+    user_id = payload.get("user_id")
+    product_name = payload.get("product_name")
+    product_type = payload.get("product_type", "펀드")
+    product_description = payload.get("product_description", "")
+    
+    # NOT NULL 컬럼에 대한 기본값 처리
+    # 예: current_value, start_date 등 필수 컬럼이 있다면 여기서 기본값을 넣어주세요.
+    # current_value = 0 
+    # start_date = datetime.now()
+
+    # 1. 필수값 검증
+    if not user_id or not product_name:
+        return {
+            "tool_name": "add_my_product",
+            "success": False,
+            "error": "user_id와 product_name은 필수입니다."
+        }
+
+    try:
+        with engine.begin() as conn: # 트랜잭션 시작
+            # 2. INSERT 쿼리 실행 (지정한 컬럼만)
+            # (나머지 컬럼은 DB 설정상 NULL 허용이거나 Default가 있어야 함)
+            query = text("""
+                INSERT INTO my_products (user_id, product_name, product_type, product_description)
+                VALUES (:uid, :pname, :ptype, :pdesc)
+            """)
+            
+            conn.execute(query, {
+                "uid": user_id,
+                "pname": product_name,
+                "ptype": product_type,
+                "pdesc": product_description
+            })
+
+        logger.info(f"User {user_id} added fund '{product_name}' to my_products.")
+
+        return {
+            "tool_name": "add_my_product",
+            "success": True,
+            "message": f"'{product_name}' 상품 가입이 완료되었습니다."
+        }
+
+    except Exception as e:
+        logger.error(f"add_my_product Error: {e}", exc_info=True)
+        return {
+            "tool_name": "add_my_product",
+            "success": False,
+            "error": f"DB 저장 실패: {str(e)}"
+        }
