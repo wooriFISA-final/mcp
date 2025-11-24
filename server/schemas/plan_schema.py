@@ -573,3 +573,46 @@ class RecommendSavingsProductsResponse(BaseModel):
         None,
         description="오류 메시지(실패 시)",
     )
+
+    # ============================================================
+# 12. [Fund] 사용자 투자 성향 조회
+# ============================================================
+class GetUserProfileForFundRequest(BaseModel):
+    user_id: int = Field(..., description="사용자 ID")
+
+class GetUserProfileForFundResponse(BaseModel):
+    tool_name: str = Field("get_user_profile_for_fund", description="도구 이름")
+    success: bool = Field(..., description="성공 여부")
+    user_id: Optional[int] = Field(None, description="사용자 ID")
+    user_name: Optional[str] = Field(None, description="사용자 이름")
+    age: Optional[int] = Field(None, description="나이")
+    invest_tendency: Optional[str] = Field(None, description="투자 성향")
+    error: Optional[str] = Field(None, description="에러 메시지")
+
+# ============================================================
+# 13. [Fund] ML 랭킹 기반 펀드 추천 조회
+# ============================================================
+class GetMlRankedFundsRequest(BaseModel):
+    invest_tendency: str = Field(..., description="투자 성향 (예: 공격투자형)")
+    sort_by: Optional[str] = Field("score", description="정렬 기준 (score, yield_1y, yield_3m, volatility, fee, size)")
+
+class GetMlRankedFundsResponse(BaseModel):
+    tool_name: str = Field("get_ml_ranked_funds", description="도구 이름")
+    success: bool = Field(..., description="성공 여부")
+    funds: List[Dict[str, Any]] = Field([], description="추천 펀드 목록")
+    error: Optional[str] = Field(None, description="에러 메시지")
+
+# ============================================================
+# 14. [Fund] 펀드 가입 처리 (my_products 적재)
+# ============================================================
+class AddMyProductRequest(BaseModel):
+    user_id: int = Field(..., description="사용자 ID")
+    product_name: str = Field(..., description="상품명")
+    product_type: Optional[str] = Field("펀드", description="상품 유형")
+    product_description: Optional[str] = Field("", description="상품 설명")
+
+class AddMyProductResponse(BaseModel):
+    tool_name: str = Field("add_my_product", description="도구 이름")
+    success: bool = Field(..., description="성공 여부")
+    message: Optional[str] = Field(None, description="성공 메시지")
+    error: Optional[str] = Field(None, description="에러 메시지")
