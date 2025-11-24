@@ -52,9 +52,10 @@ all_app = FastAPI(
 all_app.include_router(mcp_route.mcp_router)  # MCP Tools 원본 API
 all_app.include_router(data_route.resource_router) # resource 관련 Tool API
 
-# 🎯 Report Agent Tools 라우터 추가
-all_app.include_router(report_db_tools.router)
-all_app.include_router(report_agent_tools.router)
+# 🚨 [제거된 코드] 아래 두 라인을 제거합니다. 이 라우터들은
+#     data_route.resource_router에 의해 이미 등록되었을 가능성이 높습니다.
+# all_app.include_router(report_db_tools.router)
+# all_app.include_router(report_agent_tools.router)
 
 all_app.include_router(create_mcp_admin_router(mcp))
 # all_app.include_router(create_mcp_admin_router(mcp))  # MCP 관리 API

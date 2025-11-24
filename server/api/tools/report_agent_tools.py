@@ -4,6 +4,8 @@ import logging
 import pandas as pd
 import json
 import re 
+import time  # 🚨 [추가] time.sleep 사용을 위해 추가
+import glob  # 🚨 [추가] PDF 파일 경로 검색을 위해 추가
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Body
 from datetime import datetime, date
@@ -11,7 +13,9 @@ from dotenv import load_dotenv, find_dotenv, dotenv_values
 from pathlib import Path
 from langchain_huggingface import HuggingFaceEndpointEmbeddings 
 from langchain_community.vectorstores import FAISS
-from pathlib import Path
+# 🚨 [추가] 벡터 DB 구축에 필요한 라이브러리 임포트
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
 # ------------------------------------------------------------------
@@ -35,13 +39,13 @@ _cleanup_rag_env()
 # 🎯 [ENV 파일 값 직접 로드]: 셸 환경 변수와의 충돌을 막기 위해 파일 내용만 다시 읽어옵니다.
 ENV_VALUES = dotenv_values(find_dotenv(usecwd=True, raise_error_if_not_found=False) or find_dotenv(usecwd=True) or find_dotenv(".."))
 
-
 # 🎯 [요청 경로 반영]
 from server.schemas.report_schema import (
     AnalyzeSpendingInput, AnalyzeSpendingOutput, 
     FinalSummaryInput, FinalSummaryOutput, 
     ToolSkippedOutput, PolicyRAGSearchInput, PolicyRAGSearchOutput 
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -57,10 +61,131 @@ HF_EMBEDDING_MODEL = ENV_VALUES.get("HF_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-
 VECTOR_DB_PATH = ENV_VALUES.get("VECTOR_DB_PATH", '../data/faiss_index')
 HUGGINGFACEHUB_API_TOKEN = ENV_VALUES.get("HUGGINGFACEHUB_API_TOKEN")
 
+# 🚨 [추가] 정책 문서 디렉토리 경로 (원본 코드에서 가져옴)
+POLICY_DIR = "../data/policy_documents"
+
 router = APIRouter(
     prefix="/report_processing",
     tags=["Report Processing Tools"] 
 )
+
+
+
+# ==============================================================================
+# 🎯 [신규 TOOL 0] 벡터 DB 재구축 및 업데이트 (가장 상위의 독립 TOOL로 배치)
+# ==============================================================================
+@router.post(
+    "/rebuild_vector_db",
+    summary="정책 문서를 기반으로 FAISS 벡터 DB를 재구축",
+    operation_id="rebuild_vector_db_tool", # ⭐ Agent 호출 ID
+    description="data/policy_documents 폴더의 모든 PDF를 읽어 벡터 DB를 완전히 새로 구축합니다.",
+    response_model=dict,
+)
+async def api_rebuild_vector_db() -> dict:
+    """PDF 파일을 로드, 분할, 임베딩하여 FAISS 벡터 DB를 구축합니다."""
+    
+    logger.info(f"--- RAG 벡터 데이터베이스 구축 시작 (Model: {HF_EMBEDDING_MODEL}) ---")
+    
+    # 1. PDF 파일 경로 확인 및 로드
+    if not os.path.exists(POLICY_DIR):
+        error_msg = f"❌ '{POLICY_DIR}' 폴더가 존재하지 않습니다. data/policy_documents 폴더를 확인해주세요."
+        logger.error(error_msg)
+        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+    file_paths = glob.glob(os.path.join(POLICY_DIR, '*.pdf'))
+    if not file_paths:
+        info_msg = f"✅ policy_documents 폴더에 PDF 파일이 없습니다. 문서를 추가해 주세요."
+        logger.info(info_msg)
+        return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
+
+    documents = []
+    for file_path in file_paths:
+        loader = PyPDFLoader(file_path)
+        documents.extend(loader.load())
+
+    # 2. 텍스트 분할 (Split) - [정책 구조 기반 최적화] (원본 로직 그대로 사용)
+    custom_separators = [
+        r"\n제[0-9]{1,3}장\s",
+        r"\n제[0-9]{1,3}조\s",
+        r"\n[가-힣\d]\.\s?",
+        r"\n\([가-힣\d]{1,2}\)\s?",
+        r"\n",                           
+        " ",
+        ""
+    ]
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,  
+        chunk_overlap=50, 
+        separators=custom_separators,
+        keep_separator=True
+    )
+    texts = text_splitter.split_documents(documents)
+    logger.info(f"➡️ 총 {len(documents)}개 문서에서 {len(texts)}개의 텍스트 청크 생성 완료.")
+    
+    # 3. 임베딩 모델 로드 (HuggingFace Endpoint API 사용)
+    if not HUGGINGFACEHUB_API_TOKEN:
+        error_msg = "❌ HUGGINGFACEHUB_API_TOKEN 환경 변수가 설정되지 않았습니다."
+        logger.error(error_msg)
+        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+    
+    try:
+        embeddings = HuggingFaceEndpointEmbeddings(
+            model=HF_EMBEDDING_MODEL, 
+            huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
+        )
+    except Exception as e:
+        error_msg = f"🚨 임베딩 모델 로드 실패: {e}"
+        logger.error(error_msg)
+        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+    # 4. 벡터 DB 생성 및 저장 (원본 로직 그대로 사용)
+    logger.info(f"💾 FAISS 벡터 DB 생성 중... ({len(texts)}개 청크)")
+    batch_size = 32
+    sleep_time = 3
+    
+    if not texts:
+        return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": "경고: 분할된 텍스트 청크가 없어 DB 구축을 건너뜁니다."}
+        
+    first_batch = texts[:batch_size]
+    remaining_texts = texts[batch_size:]
+
+    try:
+        # DB 초기 생성
+        db = FAISS.from_documents(first_batch, embeddings)
+    except Exception as e:
+        error_msg = f"🚨 DB 초기 생성 실패: {e}"
+        logger.error(error_msg)
+        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+    # 나머지 청크를 배치 처리
+    total_processed = len(first_batch)
+    
+    for i in range(0, len(remaining_texts), batch_size):
+        batch = remaining_texts[i:i + batch_size]
+        logger.info(f"   -- API 요청 지연 ({sleep_time}초 대기) --")
+        time.sleep(sleep_time)
+        
+        try:
+            # DB에 추가
+            db.add_documents(batch)
+            total_processed += len(batch)
+            logger.info(f"   -> {total_processed} / {len(texts)}개 청크 추가 완료.")
+        except Exception as e:
+            error_msg = f"🚨 임베딩 오류 발생: {e}. DB 구축을 중단합니다."
+            logger.error(error_msg)
+            return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+    # 벡터 DB 경로 생성 및 저장
+    Path(VECTOR_DB_PATH).mkdir(parents=True, exist_ok=True)
+    db.save_local(VECTOR_DB_PATH) 
+
+    info_msg = f"--- ✅ 벡터 DB 구축 완료 --- (저장 경로: {VECTOR_DB_PATH})"
+    logger.info(info_msg)
+    return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
+
+
+
 
 # ------------------------------------------------------------------
 # 🎯 정책 PDF 구조에 맞춰 RAG 검색을 자동화할 키워드 목록
