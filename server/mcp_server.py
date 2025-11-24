@@ -1,3 +1,6 @@
+# ============================================
+# server/mcp_server.py
+# ============================================
 from fastmcp import FastMCP
 from fastapi import FastAPI
 from server.api.tools.user_tools import create_user, get_user

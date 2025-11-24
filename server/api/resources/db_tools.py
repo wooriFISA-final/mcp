@@ -1,6 +1,8 @@
 import os
 import logging
 from typing import Any, Dict
+import pandas as pd
+from typing import Dict, Any
 
 from fastapi import APIRouter, Body
 from sqlalchemy import create_engine, text
@@ -511,164 +513,25 @@ async def api_save_summary_report(
             )
 
         logger.info(f"✅ summary_report 저장 완료 (user_id={user_id}, plan_id={plan_id})")
-        return SaveSummaryReportResponse(
-            success=True,
-            user_id=user_id,
-        )
+        return {
+            "tool_name": "save_summary_report",
+            "success": True,
+            "user_id": user_id,
+        }
 
     except Exception as e:
         logger.error(f"save_summary_report Error: {e}", exc_info=True)
-        return SaveSummaryReportResponse(
-            success=False,
-            user_id=payload.user_id or 1,
-            error=str(e),
-        )
+        return {
+            "tool_name": "save_summary_report",
+            "success": False,
+            "user_id": payload.get("user_id", 1),
+            "error": str(e),
+        }
 
 
 # ============================================================
-# 7. 펀드 추천용 사용자 프로필 조회
+# 7. # 사용자 투자 성향 조회
 # ============================================================
-@router.post(
-    "/get_user_profile_for_fund",
-    summary="펀드 추천용 사용자 프로필 조회",
-    operation_id="get_user_profile_for_fund",
-    response_model=GetUserProfileForFundResponse,
-)
-async def api_get_user_profile_for_fund(
-    payload: GetUserProfileForFundRequest = Body(...),
-) -> GetUserProfileForFundResponse:
-    user_id = payload.user_id or 1
-
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    """
-                    SELECT
-                        user_id,
-                        user_name,
-                        age,
-                        salary,
-                        invest_tendency,
-                        income_usage_ratio,
-                        initial_prop,
-                        shortage_amount,
-                        hope_price
-                    FROM members
-                    WHERE user_id = :uid
-                    LIMIT 1
-                """
-                ),
-                {"uid": user_id},
-            ).mappings().first()
-
-        if not row:
-            return GetUserProfileForFundResponse(
-                success=False,
-                user_profile=None,
-                error=f"user_id={user_id} 의 정보를 찾을 수 없습니다.",
-            )
-
-        return GetUserProfileForFundResponse(
-            success=True,
-            user_profile=dict(row),
-        )
-
-    except Exception as e:
-        logger.error(f"get_user_profile_for_fund Error: {e}", exc_info=True)
-        return GetUserProfileForFundResponse(
-            success=False,
-            user_profile=None,
-            error=str(e),
-        )
-
-
-# ============================================================
-# 8. 내가 투자중인 상품 DB 추가 (my_products)
-# ============================================================
-@router.post(
-    "/add_my_product",
-    summary="사용자 보유 금융상품 추가",
-    operation_id="add_my_product",
-    response_model=AddMyProductResponse,
-)
-async def api_add_my_product(
-    payload: AddMyProductRequest = Body(...),
-) -> AddMyProductResponse:
-    try:
-        user_id = payload.user_id
-        product_name = payload.product_name.strip()
-        product_type = payload.product_type
-        product_description = (payload.product_description or "").strip()
-        current_value = payload.current_value or 0
-        preferential_interest_rate = payload.preferential_interest_rate
-        end_date = payload.end_date  # '2025-12-31' 같은 형태 기대
-
-        if not user_id or not product_name or product_type not in ("예금", "적금", "펀드"):
-            return AddMyProductResponse(
-                success=False,
-                product_id=None,
-                error="user_id, product_name, product_type('예금'|'적금'|'펀드')는 필수입니다.",
-            )
-
-        with engine.begin() as conn:
-            result = conn.execute(
-                text(
-                    """
-                    INSERT INTO my_products (
-                        user_id,
-                        product_name,
-                        product_type,
-                        product_description,
-                        current_value,
-                        preferential_interest_rate,
-                        end_date,
-                        created_at,
-                        is_ended
-                    )
-                    VALUES (
-                        :user_id,
-                        :product_name,
-                        :product_type,
-                        :product_description,
-                        :current_value,
-                        :preferential_interest_rate,
-                        :end_date,
-                        NOW(),
-                        FALSE
-                    )
-                """
-                ),
-                {
-                    "user_id": user_id,
-                    "product_name": product_name,
-                    "product_type": product_type,
-                    "product_description": product_description,
-                    "current_value": current_value,
-                    "preferential_interest_rate": preferential_interest_rate,
-                    "end_date": end_date,
-                },
-            )
-            new_id = result.lastrowid
-
-        logger.info(
-            f"✅ add_my_product 완료 — user_id={user_id}, product_id={new_id}, "
-            f"name={product_name}, type={product_type}"
-        )
-        return AddMyProductResponse(
-            success=True,
-            product_id=int(new_id),
-        )
-
-    except Exception as e:
-        logger.error(f"add_my_product Error: {e}", exc_info=True)
-        return AddMyProductResponse(
-            success=False,
-            product_id=None,
-            error=str(e),
-        )
-
-# 사용자 투자 성향 조회
 @router.post(
     "/get_user_profile_for_fund",
     summary="사용자 투자 성향 조회",
@@ -697,7 +560,7 @@ async def api_get_user_profile_for_fund(
     if not user_id:
         return {
             "tool_name": "get_user_profile_for_fund",
-            "success": False,
+            "success": True,
             "error": "입력값에 'user_id'가 누락되었습니다.",
         }
 
@@ -750,15 +613,14 @@ async def api_get_user_profile_for_fund(
             "error": f"DB 조회 중 오류 발생: {str(e)}",
         }
 
-# 사용자 투자성향 조회 후 최종품질종합점수 TOP2 조회
+
+# ============================================================
+# 8. ml기반 종합점수 Top2 펀드 추천  + 사용자 의도에 따라 정렬
+# ============================================================
 @router.post(
     "/get_ml_ranked_funds",
-    summary="투자성향별 ML 펀드 랭킹 조회",
+    summary="투자성향 및 조건별 ML 펀드 랭킹 조회",
     operation_id="get_ml_ranked_funds",
-    description=(
-        "사용자의 투자 성향(invest_tendency)을 입력받아, "
-        "허용된 위험 등급별로 '최종_종합품질점수'가 가장 높은 상위 2개 펀드를 조회합니다."
-    ),
     response_model=dict,
 )
 async def api_get_ml_ranked_funds(
@@ -767,9 +629,11 @@ async def api_get_ml_ranked_funds(
     """
     DB의 fund_ranking_snapshot 테이블에서 성향에 맞는 펀드를 조회하는 Tool.
     """
-    # 1. 입력값 검증
+    # 1. 입력값 추출
     invest_tendency = payload.get("invest_tendency")
-    
+    sort_by = payload.get("sort_by", "score") # 기본값: 종합 점수(score)
+
+    # 2. [Validation] 필수 값 확인
     if not invest_tendency:
         return {
             "tool_name": "get_ml_ranked_funds",
@@ -777,7 +641,7 @@ async def api_get_ml_ranked_funds(
             "funds": [],
             "error": "입력값에 'invest_tendency'(투자성향)가 누락되었습니다."
         }
-    
+
     # [설정] 투자 성향별 허용 등급 매핑
     investor_style_to_grades = {
         '공격투자형': ["매우 높은 위험", "높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
@@ -786,55 +650,81 @@ async def api_get_ml_ranked_funds(
         '안정추구형': ["다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
         '안정형': ["보통 위험", "낮은 위험", "매우 낮은 위험"]
     }
-    
-    # 2. 허용 등급 확인 (기본값 제거)
-    # 사용자의 입력값(invest_tendency)이 딕셔너리 키에 있는지 확인
+
+    # 3. [Validation] 유효한 투자 성향인지 확인 (Fail-Fast)
     if invest_tendency not in investor_style_to_grades:
-        #매핑되지 않는 성향이 들어오면 에러 반환 (Fail-Fast)
+        # 정의되지 않은 성향이 들어오면 즉시 에러 반환
         return {
             "tool_name": "get_ml_ranked_funds",
             "success": False,
             "funds": [],
-            "error": f"유효하지 않은 투자 성향입니다: '{invest_tendency}' (허용된 값: {list(investor_style_to_grades.keys())})"
+            "error": f"잘못된 투자 성향입니다: '{invest_tendency}'. (허용된 값: {list(investor_style_to_grades.keys())})"
         }
-
-    # 유효한 경우에만 가져옴
-    allowed_risks = investor_style_to_grades[invest_tendency]
     
+    # 유효하다면 허용 등급 가져오기
+    allowed_risks = investor_style_to_grades[invest_tendency]
+
+    # 4. 정렬 기준 매핑 (DB 한글 컬럼명 <-> 정렬 키워드)
+    sort_column_map = {
+        "score": "최종_종합품질점수",
+        "yield_1y": "1년_수익률",
+        "yield_3m": "3개월_수익률",
+        "volatility": "1년_변동성",
+        "fee": "총보수(%)",
+        "size": "운용_규모(억)"
+    }
+    
+    # 정렬 컬럼 결정 (매핑 안 되면 기본값 '최종_종합품질점수')
+    db_sort_col = sort_column_map.get(sort_by, "최종_종합품질점수")
+    
+    # 오름차순 정렬이 필요한 항목 (낮을수록 좋은 것: 변동성, 수수료)
+    ascending_sort_keys = ['volatility', 'fee']
+    is_ascending = True if sort_by in ascending_sort_keys else False
+
     try:
-        # 3. DB에서 데이터 조회
+        # 5. DB 조회
         query = "SELECT * FROM fund_ranking_snapshot"
         df = pd.read_sql(query, engine)
         
         if df.empty:
              return {
                  "tool_name": "get_ml_ranked_funds", 
-                 "success": False, 
+                 "success": True, 
                  "funds": [],
                  "error": "펀드 데이터베이스가 비어 있습니다."
              }
 
-
+        # 띄어쓰기 무시를 위한 정규화 (DB 데이터 전처리)
         df['risk_normalized'] = df['위험등급'].astype(str).str.replace(" ", "").str.strip()
-
+        
         final_list = []
         
-        # 4. 각 허용 등급별로 Top 2 선별
+        # 6. 등급별 Top 2 선별
         for risk in allowed_risks:
+            # 검색 키워드도 공백 제거
             search_key = risk.replace(" ", "").strip()
-
-            group_df = df[df['risk_normalized'] == search_key].sort_values(
-                by='최종_종합품질점수', ascending=False
+            
+            # (1) 해당 등급 필터링 
+            # (2) 점수 없는 행 제외(dropna) 
+            # (3) 정렬 기준(db_sort_col)으로 정렬 
+            # (4) 상위 2개 추출
+            group_df = df[df['risk_normalized'] == search_key].dropna(subset=['최종_종합품질점수']).sort_values(
+                by=db_sort_col, ascending=is_ascending
             ).head(2)
             
             for _, row in group_df.iterrows():
                 fund_data = {
+                    # --- 기본 정보 ---
                     "product_name": row['펀드명'],
                     "risk_level": row['위험등급'],
-                    "final_quality_score": round(row['최종_종합품질점수'], 2),
-                    "perf_score": round(row['종합_성과_점수'], 2),    
-                    "stab_score": round(row['종합_안정성_점수'], 2),
                     "description": str(row.get('설명', ''))[:500] + "..." if row.get('설명') else "설명 없음",
+                    
+                    # --- 점수 정보 (0~100점 스케일) ---
+                    "final_quality_score": round(row['최종_종합품질점수'], 1),
+                    "perf_score": round(row['종합_성과_점수'], 1),    
+                    "stab_score": round(row['종합_안정성_점수'], 1),
+                    
+                    # --- 근거 데이터 (Evidence) - DB 한글 컬럼 매핑 ---
                     "evidence": {
                         "return_1y": row.get('1년_수익률', 0),
                         "return_3m": row.get('3개월_수익률', 0),
@@ -849,12 +739,12 @@ async def api_get_ml_ranked_funds(
         if not final_list:
             return {
                 "tool_name": "get_ml_ranked_funds",
-                "success": False, # 성공이 아님
+                "success": True, # 로직은 성공했으나 결과가 없는 경우
                 "funds": [],
-                "error": f"성향('{invest_tendency}')에 맞는 펀드를 DB에서 찾을 수 없습니다."
+                "error": "조건에 맞는 펀드를 찾을 수 없습니다." # (DB에 데이터가 부족할 때)
             }
 
-        logger.info(f"Invest tendency '{invest_tendency}' -> Found {len(final_list)} funds.")
+        logger.info(f"Invest tendency '{invest_tendency}' (Sort: {sort_by}) -> Found {len(final_list)} funds.")
         
         return {
             "tool_name": "get_ml_ranked_funds",
@@ -868,11 +758,13 @@ async def api_get_ml_ranked_funds(
             "tool_name": "get_ml_ranked_funds",
             "success": False,
             "funds": [],
-            "error": str(e),
+            "error": f"DB 조회 중 오류 발생: {str(e)}"
         }
+    
 
-
-# 4. 펀드 가입 처리 (my_products 테이블 적재)
+# ============================================================
+# 9. 펀드 가입 처리 (my_products 테이블 적재)
+# ============================================================
 @router.post(
     "/add_my_product",
     summary="사용자 펀드 가입 처리",
