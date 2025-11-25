@@ -35,6 +35,8 @@ from server.schemas.plan_schema import (
     GetSavingsCandidatesResponse,
     RecommendSavingsProductsRequest,
     RecommendSavingsProductsResponse,
+    CheckPlanCompletionRequest,
+    CheckPlanCompletionResponse,
 )
 
 # 라우터 설정
@@ -420,6 +422,67 @@ async def validate_input_data(
             missing_fields=[],
             message=str(e),
         )
+        
+# 6. 입력 완료 여부 판단 Tool
+@router.post(
+    "/check_plan_completion",
+    summary="주택 계획 입력 완료 여부 판단",
+    operation_id="check_plan_completion",
+    description=(
+        "대화 메시지 히스토리를 기반으로 주택 자금 계획 입력이 완료되었는지를 판단합니다.\n\n"
+        "기본 동작:\n"
+        "- 마지막 assistant/ai 메시지가 '정리해 보면'으로 시작하면 완료로 간주합니다.\n"
+        "- 그 외에는 미완료로 간주하고 is_complete=False 를 반환합니다.\n\n"
+        "향후에는 LLM을 사용해 5개 필드(initial_prop, hope_location, hope_price, "
+        "hope_housing_type, income_usage_ratio)의 실제 채워짐 여부를 더 정교하게 판단하도록 확장할 수 있습니다."
+    ),
+    response_model=CheckPlanCompletionResponse,
+)
+async def check_plan_completion(
+    payload: CheckPlanCompletionRequest = Body(...),
+) -> CheckPlanCompletionResponse:
+    """
+    PlanInputAgent 대화 히스토리(messages)를 받아,
+    마지막 assistant/ai 발화가 '정리해 보면'으로 시작하는지 여부를 기준으로
+    입력 완료 여부를 판단하는 간단한 Tool.
+
+    👉 기존 PlanInputAgent.run() 안에서 하던
+       `text.startswith("정리해 보면")` 로직을 MCP Tool로 분리한 버전.
+    """
+    try:
+        messages = payload.messages or []
+        is_complete = False
+        summary_text: Optional[str] = None
+
+        # 뒤에서부터 assistant/ai 메시지 찾기
+        for msg in reversed(messages):
+            role = (msg.get("role") or "").lower()
+            content = (msg.get("content") or "").strip()
+
+            if role in ("assistant", "ai"):
+                # 기존 프롬프트 규칙:
+                # "정리해 보면"으로 시작하면 입력 완료로 판단
+                if content.startswith("정리해 보면"):
+                    is_complete = True
+                    summary_text = content
+                break
+
+        return CheckPlanCompletionResponse(
+            success=True,
+            is_complete=is_complete,
+            missing_fields=[],      # 지금은 요약 문구 기준만 사용 → 누락 필드는 비워둠
+            summary_text=summary_text,
+            error=None,
+        )
+    except Exception as e:
+        logger.error(f"check_plan_completion Error: {e}", exc_info=True)
+        return CheckPlanCompletionResponse(
+            success=False,
+            is_complete=False,
+            missing_fields=[],
+            summary_text=None,
+            error=str(e),
+        )
 
 
 # 6. 예·적금 Top3 필터링 Tool (CSV + 조건 필터링)
@@ -585,175 +648,6 @@ async def filter_top_savings_products(
             "top_deposits": [],
             "top_savings": [],
         }
-
-
-# 7. 리스크 레벨별 예상 수익률 Top1만 뽑아주는 순수 Tool
-@router.post(
-    "/select_top_by_risk",
-    summary="리스크 레벨별 펀드 Top1 선별",
-    operation_id="select_top_funds_by_risk",
-    description=(
-        "펀드 원시 데이터(Raw Fund Data)를 입력받아, "
-        "`risk_level`별로 `expected_return`(예상 수익률)이 가장 높은 상품을 "
-        "**각각 1개씩** 선별하여 반환합니다."
-    ),
-    response_model=SelectTopFundsByRiskResponse,
-)
-async def select_top_funds_by_risk(
-    payload: SelectTopFundsByRiskRequest = Body(...),
-) -> SelectTopFundsByRiskResponse:
-    """
-    리스크 레벨별로 예상 수익률이 가장 높은 펀드 상품을 1개씩 선별하는 Tool.
-    (LLM, LangGraph 사용 X / 순수 파이썬 로직만 사용)
-    """
-
-    # -----------------------------
-    # ① 내부 유틸: 펀드 데이터 로드
-    # -----------------------------
-    def _load_fund_data(
-        fund_data: Optional[List[Dict[str, Any]]] = None,
-        fund_data_path: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        1순위: fund_data(바디 내 리스트) 사용
-        2순위: fund_data_path(파일 경로)에서 JSON 로드
-        """
-        # 1) 바디에 fund_data가 직접 들어온 경우
-        if fund_data:
-            if isinstance(fund_data, list):
-                return fund_data
-            else:
-                raise ValueError("fund_data는 리스트 형식이어야 합니다.")
-
-        # 2) 파일 경로 기반 로드
-        path = fund_data_path or ""
-        if not path or not os.path.exists(path):
-            logger.warning(
-                "fund_data_path가 전달되지 않았거나 존재하지 않아 기본 경로를 사용합니다. "
-                f"(입력값: {path})"
-            )
-            # 🔁 기본 경로(환경에 맞게 수정 가능)
-            default_path = Path(__file__).resolve().parents[2] / "fund_data.json"
-            path = str(default_path)
-
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"펀드 데이터 파일을 찾을 수 없습니다: {path}")
-
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        if not isinstance(data, list):
-            raise ValueError("펀드 데이터 JSON의 최상위 구조는 리스트여야 합니다.")
-
-        return data
-
-    # -----------------------------
-    # ② 내부 유틸: 기대수익률 파싱
-    # -----------------------------
-    def _parse_expected_return(value: Any) -> float:
-        """
-        expected_return 값을 숫자로 파싱.
-        예:
-        - '12.5%' -> 12.5
-        - '8'     -> 8.0
-        - 0.08    -> 0.08 (그대로)
-        """
-        if value is None:
-            return 0.0
-
-        # 숫자형이면 float로
-        if isinstance(value, (int, float)):
-            return float(value)
-
-        text = str(value).strip()
-        if text.endswith("%"):
-            text = text[:-1].strip()
-
-        try:
-            return float(text)
-        except ValueError:
-            return 0.0
-
-    try:
-        fund_data_in_body = payload.fund_data
-        fund_data_path = payload.fund_data_path
-
-        # 1) 데이터 로드
-        funds = _load_fund_data(fund_data_in_body, fund_data_path)
-
-        if not funds:
-            return SelectTopFundsByRiskResponse(
-                success=False,
-                recommendations=[],
-                meta=None,
-                error="펀드 데이터가 비어 있습니다.",
-            )
-
-        # 2) risk_level 그룹별 최고 expected_return 상품 선별
-        best_by_risk: Dict[str, Dict[str, Any]] = {}
-
-        for item in funds:
-            risk_level = item.get("risk_level")
-            if not risk_level:
-                # risk_level 없는 항목은 스킵
-                continue
-
-            score = _parse_expected_return(item.get("expected_return"))
-            current_best = best_by_risk.get(risk_level)
-
-            # 처음이거나, 기존보다 수익률이 높으면 갱신
-            if current_best is None or _parse_expected_return(current_best.get("expected_return")) < score:
-                best_by_risk[risk_level] = item
-
-        # 3) 결과 리스트 구성
-        recommendations: List[Dict[str, Any]] = []
-        for risk_level, item in best_by_risk.items():
-            recommendations.append(
-                {
-                    "risk_level": risk_level,
-                    "product_name": item.get("product_name") or item.get("name"),
-                    "expected_return": item.get("expected_return"),
-                    "description": item.get("description"),
-                    # summary_for_beginner는 이 Tool이 아니라,
-                    # 나중에 LLM Agent에서 생성하도록 남겨둠.
-                }
-            )
-
-        # expected_return 내림차순 정렬 (보기 편하게)
-        recommendations.sort(
-            key=lambda x: _parse_expected_return(x.get("expected_return")),
-            reverse=True,
-        )
-
-        return SelectTopFundsByRiskResponse(
-            success=True,
-            recommendations=recommendations,
-            meta={
-                "total_input_funds": len(funds),
-                "unique_risk_levels": len(best_by_risk),
-                "source": "fund_data_in_body" if fund_data_in_body else "fund_data_path",
-                "fund_data_path": fund_data_path,
-            },
-            error=None,
-        )
-
-    except FileNotFoundError as e:
-        logger.error(f"select_top_funds_by_risk FileNotFoundError: {e}")
-        return SelectTopFundsByRiskResponse(
-            success=False,
-            recommendations=[],
-            meta=None,
-            error=str(e),
-        )
-    except Exception as e:
-        logger.error(f"select_top_funds_by_risk Error: {e}", exc_info=True)
-        return SelectTopFundsByRiskResponse(
-            success=False,
-            recommendations=[],
-            meta=None,
-            error=str(e),
-        )
-
 
 # 8. 부족 자금(shortage_amount) 계산 Tool
 @router.post(

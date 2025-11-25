@@ -147,7 +147,53 @@ class ValidateInputResponse(BaseModel):
         None,
         description="에러 또는 추가 설명 메시지",
     )
+    
+    
+# ============================================================
+# 6) check_plan_completion ------------------------------------
+# ============================================================
 
+class CheckPlanCompletionRequest(BaseModel):
+    """
+    대화 메시지 기반으로 주택 자금 계획 입력이 완료되었는지 판단하는 요청 모델.
+
+    예시:
+    {
+      "messages": [
+        {"role": "user", "content": "현재 3억 있고, 서울 동작구 아파트 10억 정도 생각해요."},
+        {"role": "assistant", "content": "월 소득 중 주택 자금에 사용할 비율을 알려주세요."},
+        {"role": "user", "content": "한 30% 정도는 가능해요."}
+      ]
+    }
+    """
+    messages: List[Dict[str, Any]] = Field(
+        ...,
+        description="대화 메시지 리스트 (각 원소는 최소한 role, content 키를 포함하는 dict)",
+    )
+
+
+class CheckPlanCompletionResponse(BaseModel):
+    tool_name: str = Field(
+        "check_plan_completion",
+        description="주택 자금 계획 입력 완료 여부 판단",
+    )
+    success: bool = Field(..., description="처리 성공 여부")
+    is_complete: bool = Field(
+        ...,
+        description="5개 핵심 정보(initial_prop, hope_location, hope_price, hope_housing_type, income_usage_ratio)가 모두 채워졌는지 여부",
+    )
+    missing_fields: List[str] = Field(
+        default_factory=list,
+        description="아직 채워지지 않은 필드명 리스트",
+    )
+    summary_text: Optional[str] = Field(
+        None,
+        description="입력이 모두 완료된 경우, '정리해 보면,'으로 시작하는 요약 문단(선택)",
+    )
+    error: Optional[str] = Field(
+        None,
+        description="에러 발생 시 에러 메시지",
+    )
 
 # ============================================================
 # 7) select_top_funds_by_risk ---------------------------------
