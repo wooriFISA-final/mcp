@@ -4,8 +4,8 @@ import logging
 import pandas as pd
 import json
 import re 
-import time  # 🚨 [추가] time.sleep 사용을 위해 추가
-import glob  # 🚨 [추가] PDF 파일 경로 검색을 위해 추가
+import time 
+import glob  
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Body
 from datetime import datetime, date
@@ -265,7 +265,7 @@ def _find_latest_policy_file(base_dir: str) -> Optional[str]:
     날짜가 가장 최신인 파일의 경로를 반환합니다.
     """
     
-    # 🚨 [수정]: Path 객체를 사용하여 디렉토리 접근
+    # 🚨 Path 객체를 사용하여 디렉토리 접근
     policy_dir = Path(base_dir) 
     
     if not policy_dir.is_dir():
@@ -302,12 +302,11 @@ def _find_latest_policy_file(base_dir: str) -> Optional[str]:
 def _find_policies_by_marker_regex(context: str) -> List[Dict[str, str]]:
     """RAG 컨텍스트 내에서 <신설 YYYY.M.D.> 마커를 포함한 정책 구문을 정규표현식으로 추출 및 정규화."""
     
-    # 🚨 [핵심 수정 1]: RAG 컨텍스트에서 출처(Source) 정보와 관련된 모든 문자열을 미리 제거합니다.
+    # 🚨 RAG 컨텍스트에서 출처(Source) 정보와 관련된 모든 문자열을 미리 제거합니다.
     context_clean = re.sub(r'\[출처:.*?\.pdf\]', '', context, flags=re.DOTALL)
     context_clean = re.sub(r'---\n', '', context_clean, flags=re.DOTALL)
     
-    # 🎯 [수정된 정규식]: 조항 기호로 시작하고 마커로 끝나는 구문을 정확히 탐지합니다.
-    # [\s\S]*?는 개행 문자를 포함하여 비탐욕적(non-greedy)으로 마커 직전까지의 모든 텍스트를 잡습니다.
+    # 🎯 수정된 정규식: 조항 기호로 시작하고 마커로 끝나는 구문을 정확히 탐지합니다.
     regex = r"([\n\s]*([가-힣\d]+\.|\([가-힣\d]+\))[\s\S]*?)\< *(신설|개정)\s*(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*>"
     
     matches = re.findall(regex, context_clean, re.DOTALL) 
@@ -318,7 +317,7 @@ def _find_policies_by_marker_regex(context: str) -> List[Dict[str, str]]:
         # 정책 내용: 마커 직전의 텍스트와 마커를 포함
         policy_text_with_marker = full_text.strip()
         
-        # 🚨 [핵심 수정 2]: 띄어쓰기가 없는 한글/영어/숫자 사이에 공백을 삽입하여 텍스트를 정규화합니다.
+        # 🚨 띄어쓰기가 없는 한글/영어/숫자 사이에 공백을 삽입하여 텍스트를 정규화합니다.
         normalized_text = re.sub(r'([가-힣a-zA-Z\d])([가-힣a-zA-Z\d])', r'\1 \2', policy_text_with_marker).strip()
         # 다중 공백을 단일 공백으로 치환
         normalized_text = re.sub(r'\s{2,}', ' ', normalized_text)
@@ -359,11 +358,17 @@ def _generate_final_report_from_structured_data(report_month_str: str, structure
     
     이 목록을 기반으로 고객에게 전달할 **간결한 단일 단락 분석 보고서**를 한국어로 작성하십시오.
     
+    
     **보고서 형식:**
     1. 반드시 '📌 [시행일: {earliest_date}]'로 시작하십시오.
     2. 보고서는 헤더, 푸터, 제목 없이 **하나의 간결한 단락**으로 구성하십시오.
     3. 변동 사항의 핵심 내용과 고객에게 미치는 영향을 포함하여 5줄 이내로 요약하십시오.
     4. **정책 변동 사항의 목록** 외에 LTV/DSR 같은 **일반적인 배경 정보**는 포함하지 마십시오.
+    5. 출력 예시문은 다음과 같습니다.
+    "📌 [시행일: 2025-03-05] 정책 핵심 내용 요약.
+    고객 영향: 2025년 3월 5일부터 특정 대출 상품(규제지역 내 고가 주택 담보 대출, 신용대출, 
+    가계대출 등)에 대해 총부채원리금상환비율 기준을 강화해 적용하며, 
+    고객의 대출 한도 및 신규 대출 가능성에 제한이 있을 수 있습니다."
     
     [추출된 정책 변동 사항]
     {analysis_input}
@@ -408,13 +413,13 @@ def _generate_final_report_from_structured_data(report_month_str: str, structure
         }
 
 # ==============================================================================
-# 독립 Tool 1: 소비 데이터 분석 및 군집 생성 (복구)
+# 독립 Tool 1: 소비 데이터 분석 및 군집 생성 (최종 수정)
 # ==============================================================================
 @router.post(
     "/analyze_user_spending",
     summary="월별 소비 데이터 비교 분석 및 군집 생성",
     operation_id="analyze_user_spending_tool", 
-    description="두 달치 소비 데이터(DataFrame Records)를 받아 총 지출, Top 3 카테고리를 비교 분석하고, 군집 별명과 조언을 LLM을 통해 생성합니다.",
+    description="두 달치 소비 데이터(DataFrame Records)를 받아 총 지출, Top 5 카테고리를 비교 분석하고, 군집 별명과 조언을 LLM을 통해 생성합니다.",
     response_model=dict,
 )
 async def analyze_user_spending(
@@ -423,64 +428,108 @@ async def analyze_user_spending(
     ollama_model: Optional[str] = Body(QWEN_MODEL, embed=False)
 ) -> dict:
     """소비 데이터를 기반으로 군집을 분석하고, LLM을 통해 조언을 생성합니다."""
+
+    # 🚨 데이터 부족 시 처리 (이전 수정분 유지)
     if not consume_records or len(consume_records) < 2:
-        return {"tool_name": "analyze_user_spending_tool", "success": False, "error": "비교 분석을 위한 최소 2개월 데이터 부족"}
+        error_msg = "비교 분석을 위한 최소 2개월 데이터 부족" if consume_records else "분석할 소비 데이터가 존재하지 않아 건너뜁니다."
+        return {
+            "tool_name": "analyze_user_spending_tool", 
+            "success": True, 
+            "consume_report": error_msg,
+            "cluster_nickname": "분석 불가", 
+            "consume_analysis_summary": {},
+            "spend_chart_json": json.dumps({})
+        }
     
     try:
         df_consume = pd.DataFrame(consume_records)
         df_consume['spend_month'] = pd.to_datetime(df_consume['spend_month'])
         df_consume = df_consume.sort_values(by='spend_month', ascending=False)
         
-        feb_data = df_consume.iloc[0] 
+        feb_data = df_consume.iloc[0] # 최신 월 데이터
         jan_data = df_consume.iloc[1]
 
         total_spend_feb = feb_data.get('total_spend', 0) or 0
         total_spend_jan = jan_data.get('total_spend', 0) or 0
         diff = total_spend_feb - total_spend_jan
         change_rate = (diff / total_spend_jan) * 100 if total_spend_jan else 0
+        change_text = f"{diff:+,}원 ({change_rate:.2f}%) 변동"
 
         cat1_cols = [col for col in feb_data.index if col.startswith('CAT1_')]
-        feb_cats = df_consume.iloc[0][cat1_cols].sort_values(ascending=False).head(3) # 최신 데이터 사용
         
-        # 🎯 [수정] 아웃풋 필드명: consume_analysis_summary에 맞춤
+        # 🚨 [수정 1] Top 5 카테고리 추출
+        feb_cats = df_consume.iloc[0][cat1_cols].sort_values(ascending=False).head(5) 
+        
+        # 🚨 [수정 2] spend_chart_json을 위한 전체 CAT1 카테고리별 금액 계산
+        chart_data_list = []
+        for col in cat1_cols:
+            amount = feb_data.get(col, 0) or 0
+            if amount > 0:
+                chart_data_list.append({
+                    "category": col.replace('CAT1_', ''), 
+                    "amount": int(amount)
+                })
+        spend_chart_json = json.dumps(chart_data_list, ensure_ascii=False)
+        
+        # 🚨 [수정 3] consume_analysis_summary에 Top 5 반영 (키 이름 수정됨)
         consume_analysis_summary = {
             'latest_total_spend': f"{total_spend_feb:,}",
-            'total_change_diff': f"{diff:+,}",
-            'top_3_categories': [col.replace('CAT1_', '') for col in feb_cats.index],
+            'total_change_diff': f"{change_text}",
+            'top_5_categories': [col.replace('CAT1_', '') for col in feb_cats.index], 
             'member_info': member_data
         }
 
-        nickname = f"레저/여행 집중형 고객" # LLM이 변경할 수 있지만, 기본값 설정
+        # 🚨 [핵심 수정 4]: LLM이 별명과 보고서를 모두 생성하도록 프롬프트 수정
+        system_instruction = "당신은 고객의 소비 분석가이자 별명 생성 전문가입니다. 아래 분석 결과를 바탕으로 고객에게 전달할 4줄의 **간결하고 정중한** 소비 분석 보고서와 저축/투자 조언을 한국어로 작성하십시오."
+            
         prompt = f"""
-        [System] 당신은 고객의 소비 분석가입니다. 아래 분석 결과를 바탕으로 고객에게 전달할 4줄의 **간결하고 정중한** 소비 분석 보고서와 저축/투자 조언을 한국어로 작성하십시오.
+        [System] {system_instruction}
+        
         [분석 결과]
-        총 지출: {consume_analysis_summary['latest_total_spend']}원, 변화: {consume_analysis_summary['total_change_diff']}원. 
-        주 소비 영역: {', '.join(consume_analysis_summary['top_3_categories'])}. 
-        고객 정보: {member_data}
-        [보고서 형식]
-        1. 군집 별명 언급: {nickname}
-        2. 지출 변화 해석 및 주요 카테고리 설명
-        3. 연봉/부채 등을 고려한 저축/투자 조언 한 줄 포함 (예: "증가한 지출을 감안하여..." 또는 "안정적인 연봉을 바탕으로...")
+        총 지출: {consume_analysis_summary['latest_total_spend']}원, 변화: {consume_analysis_summary['total_change_diff']}. 
+        주요 5대 소비 영역: {', '.join(consume_analysis_summary['top_5_categories'])}. 
+        고객 정보: {member_data} (연봉, 부채, 신용 점수 포함)
+
+        [출력 형식]
+        1. **첫 줄에는 반드시** 분석한 소비 패턴에 가장 적합한 **군집 별명**만을 `[별명: XXX]` 형태로 작성하십시오. 이 별명은 Top 5 소비와 재정 건전성(부채 등)을 고려하여 직접 생성해야 합니다.
+        2. **두 번째 줄부터** 지출 변화 해석, 주요 카테고리 설명, 재정 조언을 포함한 4줄의 소비 분석 보고서를 작성하십시오.
+        3. 보고서 본문에는 별명을 다시 언급하지 마십시오.
+
         """
         
         payload = {"model": QWEN_MODEL, "prompt": prompt, "stream": False}
         
         response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        consume_report = response.json()['response'].strip()
+        llm_response_text = response.json()['response'].strip()
         
-        # 🎯 [수정] 아웃풋 필드명: consume_report, consume_analysis_summary
+        # 🚨 [핵심 수정 5]: LLM 응답에서 별명과 보고서를 분리하여 추출
+        nickname = "분석 불가" # 초기화 (이전 하드코딩 값 제거)
+        consume_report = llm_response_text
+        
+        # 정규식으로 [별명: XXX] 추출
+        nickname_match = re.search(r'\[별명:\s*(.+?)\]', llm_response_text, re.IGNORECASE)
+        
+        if nickname_match:
+            nickname = nickname_match.group(1).strip()
+            # 별명 태그를 제거하고 보고서 본문만 남김 (첫 줄에서만 제거)
+            consume_report = re.sub(r'\[별명:\s*(.+?)\]\s*', '', llm_response_text, count=1).strip()
+            if not consume_report:
+                consume_report = "LLM이 별명만 생성하고 보고서 내용을 생성하지 않았습니다. 다시 시도해 주세요."
+        
         return {
             "tool_name": "analyze_user_spending_tool", 
             "success": True, 
             "consume_report": consume_report,
-            "cluster_nickname": nickname,
-            "consume_analysis_summary": consume_analysis_summary
+            "cluster_nickname": nickname, 
+            "consume_analysis_summary": consume_analysis_summary, # top_5_categories 키가 포함됨
+            "spend_chart_json": spend_chart_json # 전체 카테고리 금액 JSON이 포함됨
         }
 
     except Exception as e:
         logger.error(f"소비 분석 오류: {e}")
         return {"tool_name": "analyze_user_spending_tool", "success": False, "error": str(e)}
 
+    
 # ==============================================================================
 # 독립 Tool 2: 최종 3줄 요약 LLM Tool (복구)
 # ==============================================================================
@@ -687,117 +736,6 @@ async def api_check_policy_changes(
         "policy_changes": structured_changes, # Python이 찾은 정확한 리스트를 반환
         "error": report_result['error']
     }
-
-
-# ==============================================================================
-# 독립 Tool 1: 소비 데이터 분석 및 군집 생성 (복구)
-# ==============================================================================
-@router.post(
-    "/analyze_user_spending",
-    summary="월별 소비 데이터 비교 분석 및 군집 생성",
-    operation_id="analyze_user_spending_tool", 
-    description="두 달치 소비 데이터(DataFrame Records)를 받아 총 지출, Top 3 카테고리를 비교 분석하고, 군집 별명과 조언을 LLM을 통해 생성합니다.",
-    response_model=dict,
-)
-async def analyze_user_spending(
-    consume_records: List[Dict[str, Any]] = Body(..., embed=True),
-    member_data: Dict[str, Any] = Body(..., embed=False),
-    ollama_model: Optional[str] = Body(QWEN_MODEL, embed=False)
-) -> dict:
-    """소비 데이터를 기반으로 군집을 분석하고, LLM을 통해 조언을 생성합니다."""
-    if not consume_records or len(consume_records) < 2:
-        return {"tool_name": "analyze_user_spending_tool", "success": False, "error": "비교 분석을 위한 최소 2개월 데이터 부족"}
-    
-    try:
-        df_consume = pd.DataFrame(consume_records)
-        df_consume['spend_month'] = pd.to_datetime(df_consume['spend_month'])
-        df_consume = df_consume.sort_values(by='spend_month', ascending=False)
-        
-        feb_data = df_consume.iloc[0] 
-        jan_data = df_consume.iloc[1]
-
-        total_spend_feb = feb_data.get('total_spend', 0) or 0
-        total_spend_jan = jan_data.get('total_spend', 0) or 0
-        diff = total_spend_feb - total_spend_jan
-        change_rate = (diff / total_spend_jan) * 100 if total_spend_jan else 0
-
-        cat1_cols = [col for col in feb_data.index if col.startswith('CAT1_')]
-        feb_cats = df_consume.iloc[0][cat1_cols].sort_values(ascending=False).head(3) # 최신 데이터 사용
-        
-        # 🎯 [수정] 아웃풋 필드명: consume_analysis_summary에 맞춤
-        consume_analysis_summary = {
-            'latest_total_spend': f"{total_spend_feb:,}",
-            'total_change_diff': f"{diff:+,}",
-            'top_3_categories': [col.replace('CAT1_', '') for col in feb_cats.index],
-            'member_info': member_data
-        }
-
-        nickname = f"레저/여행 집중형 고객" # LLM이 변경할 수 있지만, 기본값 설정
-        prompt = f"""
-        [System] 당신은 고객의 소비 분석가입니다. 아래 분석 결과를 바탕으로 고객에게 전달할 4줄의 **간결하고 정중한** 소비 분석 보고서와 저축/투자 조언을 한국어로 작성하십시오.
-        [분석 결과]
-        총 지출: {consume_analysis_summary['latest_total_spend']}원, 변화: {consume_analysis_summary['total_change_diff']}원. 
-        주 소비 영역: {', '.join(consume_analysis_summary['top_3_categories'])}. 
-        고객 정보: {member_data}
-        [보고서 형식]
-        1. 군집 별명 언급: {nickname}
-        2. 지출 변화 해석 및 주요 카테고리 설명
-        3. 연봉/부채 등을 고려한 저축/투자 조언 한 줄 포함 (예: "증가한 지출을 감안하여..." 또는 "안정적인 연봉을 바탕으로...")
-        """
-        
-        payload = {"model": QWEN_MODEL, "prompt": prompt, "stream": False}
-        
-        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        consume_report = response.json()['response'].strip()
-        
-        # 🎯 [수정] 아웃풋 필드명: consume_report, consume_analysis_summary
-        return {
-            "tool_name": "analyze_user_spending_tool", 
-            "success": True, 
-            "consume_report": consume_report,
-            "cluster_nickname": nickname,
-            "consume_analysis_summary": consume_analysis_summary
-        }
-
-    except Exception as e:
-        logger.error(f"소비 분석 오류: {e}")
-        return {"tool_name": "analyze_user_spending_tool", "success": False, "error": str(e)}
-
-# ==============================================================================
-# 독립 Tool 2: 최종 3줄 요약 LLM Tool (복구)
-# ==============================================================================
-@router.post(
-    "/generate_final_summary",
-    summary="최종 보고서 3줄 요약 생성",
-    operation_id="generate_final_summary_llm", 
-    description="통합 보고서 본문을 받아 핵심 내용을 3줄로 간결하게 요약합니다.",
-    response_model=dict,
-)
-async def api_generate_final_summary(report_content: str = Body(..., embed=True)) -> dict:
-    """Agent가 보고서 본문을 전송하면, LLM을 통해 3줄 핵심 요약본을 생성합니다."""
-    
-    # 🎯 [수정] 구분자 무시 지침 포함
-    prompt_template = f"""
-    [System] 당신은 전문 분석가입니다. 아래 통합 보고서 내용을 읽고, **가장 핵심적인 3가지 사항**만 뽑아 간결하게 **3줄**로 요약하십시오. 보고서 본문 외의 설명이나 제목, 또는 구분자(---SECTION_END---)와 같은 **불필요한 기호는 모두 무시**하십시오.
-    
-    [통합 보고서 내용]
-    {report_content}
-    
-    [3줄 요약]
-    """
-    
-    payload = {"model": QWEN_MODEL, "prompt": prompt_template, "stream": False, "options": {"temperature": 0.3}}
-    
-    try:
-        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        final_summary = response.json()['response'].strip()
-        lines = [line.strip() for line in final_summary.split('\n') if line.strip()]
-        threelines_summary = "\n".join(lines[:3]) # 🎯 [수정] 아웃풋 필드명에 맞춤
-        
-        return {"tool_name": "generate_final_summary_llm", "success": True, "threelines_summary": threelines_summary}
-    except requests.exceptions.RequestException as e:
-        error_msg = f"Ollama 통신 오류: {e}"
-        return {"tool_name": "generate_final_summary_llm", "success": False, "error": error_msg, "threelines_summary": "3줄 요약 생성 실패"}
 
 
 # ==============================================================================
