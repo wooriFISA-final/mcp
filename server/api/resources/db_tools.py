@@ -25,6 +25,8 @@ from server.schemas.plan_schema import (
     GetUserProfileForFundResponse,
     AddMyProductRequest,
     AddMyProductResponse,
+    AddMyFundRequest,
+    AddMyFundResponse,
 )
 
 # ----------------------------------
@@ -762,75 +764,111 @@ async def api_get_ml_ranked_funds(
     
 
 # ============================================================
-# 9. 펀드 가입 처리 (my_products 테이블 적재)
+# 9. 펀드 가입 처리 (my_products + my_fund_details 적재)
 # ============================================================
 @router.post(
     "/add_my_product",
-    summary="사용자 펀드 가입 처리",
+    summary="사용자 펀드 가입 처리 (상세정보 자동 생성)",
     operation_id="add_my_product",
-    description=(
-        "사용자가 선택한 펀드 상품을 'my_products' 테이블에 저장하여 가입 처리합니다.\n\n"
-        "입력 필드 예시:\n"
-        "- user_id: 사용자 ID (필수)\n"
-        "- product_name: 펀드 상품명 (필수)\n"
-        "- product_type: 상품 유형 (기본값: '펀드')\n"
-        "- product_description: 펀드 설명 (선택 사항)\n"
-    ),
-    response_model=dict,
+    description="사용자가 선택한 펀드 상품을 가입 처리합니다.",
+    response_model=AddMyFundResponse, # ✅ 응답 스키마 적용
 )
-async def api_add_my_product(
-    payload: Dict[str, Any] = Body(...)
-) -> dict:
-    """
-    사용자가 선택한 펀드를 my_products 테이블에 INSERT하는 Tool.
-    (필수 컬럼만 입력받아 처리합니다.)
-    """
-    user_id = payload.get("user_id")
-    product_name = payload.get("product_name")
-    product_type = payload.get("product_type", "펀드")
-    product_description = payload.get("product_description", "")
+async def api_add_my_fund(
+    payload: AddMyFundRequest = Body(...) # ✅ 요청 스키마 적용 (Dict 대신 사용)
+) -> AddMyFundResponse:
     
-    # NOT NULL 컬럼에 대한 기본값 처리
-    # 예: current_value, start_date 등 필수 컬럼이 있다면 여기서 기본값을 넣어주세요.
-    # current_value = 0 
-    # start_date = datetime.now()
+    # 1. 입력값 추출 (스키마의 principal_amount 사용)
+    user_id = payload.user_id
+    product_name = payload.product_name
+    # [수정 포인트 1] 변수명을 principal_amount로 변경
+    principal_amount = payload.principal_amount 
+    product_description = payload.product_description
+    
+    # 펀드 타입은 고정
+    product_type = "FUND"
 
-    # 1. 필수값 검증
+    # 필수값 검증
     if not user_id or not product_name:
-        return {
-            "tool_name": "add_my_product",
-            "success": False,
-            "error": "user_id와 product_name은 필수입니다."
-        }
+        return AddMyFundResponse(
+            tool_name="add_my_product",
+            success=False,
+            error="user_id와 product_name은 필수입니다."
+        )
 
     try:
-        with engine.begin() as conn: # 트랜잭션 시작
-            # 2. INSERT 쿼리 실행 (지정한 컬럼만)
-            # (나머지 컬럼은 DB 설정상 NULL 허용이거나 Default가 있어야 함)
-            query = text("""
-                INSERT INTO my_products (user_id, product_name, product_type, product_description)
-                VALUES (:uid, :pname, :ptype, :pdesc)
+        with engine.begin() as conn:
+            
+            # [Step A] 기준가 조회
+            price_query = text("""
+                SELECT 기준가 as base_price 
+                FROM fund_ranking_snapshot 
+                WHERE 펀드명 = :pname 
+                ORDER BY 날짜 DESC 
+                LIMIT 1
+            """)
+            price_row = conn.execute(price_query, {"pname": product_name}).fetchone()
+
+            if not price_row:
+                raise ValueError(f"'{product_name}' 펀드의 기준가 정보를 찾을 수 없습니다.")
+            
+            current_base_price = price_row[0]
+
+            # [Step B] 부모 테이블 (my_products) INSERT
+            # ✅ payment_amount 대신 principal_amount 컬럼에 저장
+            insert_product_query = text("""
+                INSERT INTO my_products 
+                (user_id, product_name, product_type, product_description, principal_amount, current_value, join_date)
+                VALUES 
+                (:uid, :pname, :ptype, :pdesc, :principal, :curr_val, NOW())
             """)
             
-            conn.execute(query, {
+            result = conn.execute(insert_product_query, {
                 "uid": user_id,
                 "pname": product_name,
                 "ptype": product_type,
-                "pdesc": product_description
+                "pdesc": product_description,
+                # [수정 포인트 2] 위에서 정의한 변수(principal_amount) 사용
+                "principal": principal_amount,  
+                "curr_val": principal_amount    # 초기 가치는 원금과 동일
+            })
+            
+            new_product_id = result.lastrowid
+
+            # [Step C] 자식 테이블 (my_fund_details) INSERT
+            insert_detail_query = text("""
+                INSERT INTO my_fund_details
+                (product_id, fund_name, start_base_price)
+                VALUES
+                (:pid, :pname, :start_price)
+            """)
+            
+            conn.execute(insert_detail_query, {
+                "pid": new_product_id,
+                "pname": product_name,
+                "start_price": current_base_price
             })
 
-        logger.info(f"User {user_id} added fund '{product_name}' to my_products.")
+        # [수정 포인트 3] 로그 및 메시지도 principal_amount로 변경
+        logger.info(f"User {user_id} joined fund '{product_name}' (Start Price: {current_base_price}, Amount: {principal_amount})")
 
-        return {
-            "tool_name": "add_my_product",
-            "success": True,
-            "message": f"'{product_name}' 상품 가입이 완료되었습니다."
-        }
+        return AddMyFundResponse(
+            tool_name="add_my_product",
+            success=True,
+            product_id=new_product_id,
+            message=f"'{product_name}' 가입 완료! (투자금: {principal_amount:,}원, 시작가: {current_base_price:,}원)"
+        )
 
+    except ValueError as ve:
+        logger.warning(f"add_my_product Warning: {ve}")
+        return AddMyFundResponse(
+            tool_name="add_my_product",
+            success=False,
+            error=str(ve)
+        )
     except Exception as e:
         logger.error(f"add_my_product Error: {e}", exc_info=True)
-        return {
-            "tool_name": "add_my_product",
-            "success": False,
-            "error": f"DB 저장 실패: {str(e)}"
-        }
+        return AddMyFundResponse(
+            tool_name="add_my_product",
+            success=False,
+            error=f"DB 저장 실패: {str(e)}"
+        )

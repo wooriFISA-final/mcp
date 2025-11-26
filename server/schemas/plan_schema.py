@@ -603,16 +603,18 @@ class GetMlRankedFundsResponse(BaseModel):
     error: Optional[str] = Field(None, description="에러 메시지")
 
 # ============================================================
-# 14. [Fund] 펀드 가입 처리 (my_products 적재)
+# 14. 펀드 전용 가입 요청 스키마
 # ============================================================
-class AddMyProductRequest(BaseModel):
+class AddMyFundRequest(BaseModel):
     user_id: int = Field(..., description="사용자 ID")
-    product_name: str = Field(..., description="상품명")
-    product_type: Optional[str] = Field("펀드", description="상품 유형")
+    product_name: str = Field(..., description="펀드 상품명 (정확한 이름)")
+    principal_amount: int = Field(1000000, description="가입 원금 (기본 100만원)")
     product_description: Optional[str] = Field("", description="상품 설명")
+    # product_type은 'FUND'로 고정이므로 입력 안 받아도 됨
 
-class AddMyProductResponse(BaseModel):
-    tool_name: str = Field("add_my_product", description="도구 이름")
+class AddMyFundResponse(BaseModel):
+    tool_name: Literal["add_my_fund"] = Field("add_my_fund", description="도구 이름")
     success: bool = Field(..., description="성공 여부")
-    message: Optional[str] = Field(None, description="성공 메시지")
+    product_id: Optional[int] = Field(None, description="생성된 상품 ID")
+    message: Optional[str] = Field(None, description="결과 메시지")
     error: Optional[str] = Field(None, description="에러 메시지")
