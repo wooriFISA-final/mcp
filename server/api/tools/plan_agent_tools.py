@@ -12,7 +12,6 @@ from langchain_core.embeddings import Embeddings
 from langchain_huggingface import HuggingFaceEndpointEmbeddings
 
 from langchain_ollama import OllamaEmbeddings
-import pandas as pd  # ✅ filter_top_savings_products에서 사용
 
 # 🔹 스키마 임포트
 from server.schemas.plan_schema import (
@@ -37,12 +36,18 @@ from server.schemas.plan_schema import (
     RecommendSavingsProductsResponse,
     CheckPlanCompletionRequest,
     CheckPlanCompletionResponse,
+    ValidateSelectedSavingsProductsRequest,
+    ValidateSelectedSavingsProductsResponse,
+    ValidateSelectedFundsProductsRequest,
+    ValidateSelectedFundsProductsResponse,
+    CalculatePortfolioAmountsRequest,
+    CalculatePortfolioAmountsResponse,
 )
 
 # 라우터 설정
 router = APIRouter(
     prefix="/input",  # API 엔드포인트 기본 경로
-    tags=["PlanInput & Validation Tools"]  # Swagger UI용 카테고리 표시
+    tags=["PlanInput & Validation Tools"],  # Swagger UI용 카테고리 표시
 )
 
 logger = logging.getLogger(__name__)
@@ -82,7 +87,7 @@ def _get_embeddings() -> Embeddings:
 
         _embeddings = HuggingFaceEndpointEmbeddings(
             model=embed_model,
-            task="feature-extraction",         # HF 임베딩 엔드포인트 기본 태스크
+            task="feature-extraction",  # HF 임베딩 엔드포인트 기본 태스크
             huggingfacehub_api_token=hf_token,
         )
 
@@ -368,7 +373,11 @@ async def validate_input_data(
 
         # 필수 입력 필드 정의
         required_fields = [
-            "initial_prop", "hope_location", "hope_price", "hope_housing_type", "income_usage_ratio"
+            "initial_prop",
+            "hope_location",
+            "hope_price",
+            "hope_housing_type",
+            "income_usage_ratio",
         ]
 
         # 누락 필드 검증
@@ -390,20 +399,30 @@ async def validate_input_data(
         # 각 필드별 정규화 수행
         from fastapi.encoders import jsonable_encoder
 
-        cur1 = await api_parse_currency(ParseCurrencyRequest(value=data.get("initial_prop", "0")))
-        cur2 = await api_parse_currency(ParseCurrencyRequest(value=data.get("hope_price", "0")))
-        ratio = await parse_ratio(ParseRatioRequest(value=data.get("income_usage_ratio", "0")))
-        loc = await normalize_location(NormalizeLocationRequest(location=data.get("hope_location", "")))
+        cur1 = await api_parse_currency(
+            ParseCurrencyRequest(value=data.get("initial_prop", "0"))
+        )
+        cur2 = await api_parse_currency(
+            ParseCurrencyRequest(value=data.get("hope_price", "0"))
+        )
+        ratio = await parse_ratio(
+            ParseRatioRequest(value=data.get("income_usage_ratio", "0"))
+        )
+        loc = await normalize_location(
+            NormalizeLocationRequest(location=data.get("hope_location", ""))
+        )
 
         # 정규화 완료된 결과 구성
-        normalized_data = jsonable_encoder({
-            "initial_prop": cur1.parsed,
-            "hope_location": loc.normalized,
-            "hope_price": cur2.parsed,
-            "hope_housing_type": data.get("hope_housing_type"),
-            "income_usage_ratio": ratio.ratio,
-            "validation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        })
+        normalized_data = jsonable_encoder(
+            {
+                "initial_prop": cur1.parsed,
+                "hope_location": loc.normalized,
+                "hope_price": cur2.parsed,
+                "hope_housing_type": data.get("hope_housing_type"),
+                "income_usage_ratio": ratio.ratio,
+                "validation_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
 
         return ValidateInputResponse(
             success=True,
@@ -422,7 +441,8 @@ async def validate_input_data(
             missing_fields=[],
             message=str(e),
         )
-        
+
+
 # 6. 입력 완료 여부 판단 Tool
 @router.post(
     "/check_plan_completion",
@@ -445,9 +465,6 @@ async def check_plan_completion(
     PlanInputAgent 대화 히스토리(messages)를 받아,
     마지막 assistant/ai 발화가 '정리해 보면'으로 시작하는지 여부를 기준으로
     입력 완료 여부를 판단하는 간단한 Tool.
-
-    👉 기존 PlanInputAgent.run() 안에서 하던
-       `text.startswith("정리해 보면")` 로직을 MCP Tool로 분리한 버전.
     """
     try:
         messages = payload.messages or []
@@ -460,8 +477,6 @@ async def check_plan_completion(
             content = (msg.get("content") or "").strip()
 
             if role in ("assistant", "ai"):
-                # 기존 프롬프트 규칙:
-                # "정리해 보면"으로 시작하면 입력 완료로 판단
                 if content.startswith("정리해 보면"):
                     is_complete = True
                     summary_text = content
@@ -470,7 +485,7 @@ async def check_plan_completion(
         return CheckPlanCompletionResponse(
             success=True,
             is_complete=is_complete,
-            missing_fields=[],      # 지금은 요약 문구 기준만 사용 → 누락 필드는 비워둠
+            missing_fields=[],
             summary_text=summary_text,
             error=None,
         )
@@ -485,8 +500,7 @@ async def check_plan_completion(
         )
 
 
-# 6. 예·적금 Top3 필터링 Tool (CSV + 조건 필터링)
-# ➜ plan_schema.py에 Request/Response 정의가 안 보였으니까 일단 dict 유지
+# 7. 예·적금 Top3 필터링 Tool (CSV + 조건 필터링)
 @router.post(
     "/filter_top_products",
     summary="예·적금 Top3 상품 필터링",
@@ -515,7 +529,7 @@ async def check_plan_completion(
     response_model=dict,
 )
 async def filter_top_savings_products(
-    payload: Dict[str, Any] = Body(...)
+    payload: Dict[str, Any] = Body(...),
 ) -> dict:
     """
     예·적금 CSV에서 사용자 조건에 맞는 상품을 필터링하고,
@@ -531,7 +545,9 @@ async def filter_top_savings_products(
                 "csv_file_path가 전달되지 않았거나 존재하지 않아 기본 경로를 사용합니다. "
                 f"(입력값: {csv_path})"
             )
-            default_path = Path(__file__).resolve().parents[2] / "data" / "saving_data.csv"
+            default_path = (
+                Path(__file__).resolve().parents[2] / "data" / "saving_data.csv"
+            )
             csv_path = str(default_path)
 
         if not os.path.exists(csv_path):
@@ -568,15 +584,22 @@ async def filter_top_savings_products(
         # 3-1) 예금 필터링
         # ============================
         try:
-            deposits_df = all_products_df[all_products_df["product_type"] == "예금"].copy()
+            deposits_df = all_products_df[
+                all_products_df["product_type"] == "예금"
+            ].copy()
 
             # 나이 조건
             if "condition_min_age" in deposits_df.columns:
                 deposits_df = deposits_df[deposits_df["condition_min_age"] <= age]
 
             # 첫거래 조건
-            if "condition_first_customer" in deposits_df.columns and not is_first_customer:
-                deposits_df = deposits_df[deposits_df["condition_first_customer"] == False]
+            if (
+                "condition_first_customer" in deposits_df.columns
+                and not is_first_customer
+            ):
+                deposits_df = deposits_df[
+                    deposits_df["condition_first_customer"] == False
+                ]
 
             # 기간 조건
             if {"min_term", "max_term"}.issubset(deposits_df.columns):
@@ -587,7 +610,9 @@ async def filter_top_savings_products(
 
             # 금리 기준 Top3
             if "max_rate" in deposits_df.columns:
-                deposits_df = deposits_df.sort_values(by="max_rate", ascending=False)
+                deposits_df = deposits_df.sort_values(
+                    by="max_rate", ascending=False
+                )
 
             top_3_deposits = deposits_df.head(3)
             top_deposits = top_3_deposits.to_dict(orient="records")
@@ -599,15 +624,22 @@ async def filter_top_savings_products(
         # 3-2) 적금 필터링
         # ============================
         try:
-            savings_df = all_products_df[all_products_df["product_type"] == "적금"].copy()
+            savings_df = all_products_df[
+                all_products_df["product_type"] == "적금"
+            ].copy()
 
             # 나이 조건
             if "condition_min_age" in savings_df.columns:
                 savings_df = savings_df[savings_df["condition_min_age"] <= age]
 
             # 첫거래 조건
-            if "condition_first_customer" in savings_df.columns and not is_first_customer:
-                savings_df = savings_df[savings_df["condition_first_customer"] == False]
+            if (
+                "condition_first_customer" in savings_df.columns
+                and not is_first_customer
+            ):
+                savings_df = savings_df[
+                    savings_df["condition_first_customer"] == False
+                ]
 
             # 기간 조건
             if {"min_term", "max_term"}.issubset(savings_df.columns):
@@ -618,7 +650,9 @@ async def filter_top_savings_products(
 
             # 금리 기준 Top3
             if "max_rate" in savings_df.columns:
-                savings_df = savings_df.sort_values(by="max_rate", ascending=False)
+                savings_df = savings_df.sort_values(
+                    by="max_rate", ascending=False
+                )
 
             top_3_savings = savings_df.head(3)
             top_savings = top_3_savings.to_dict(orient="records")
@@ -649,6 +683,7 @@ async def filter_top_savings_products(
             "top_savings": [],
         }
 
+
 # 8. 부족 자금(shortage_amount) 계산 Tool
 @router.post(
     "/calc_shortage",
@@ -667,6 +702,7 @@ async def calc_shortage_amount(
     희망 주택 가격, 대출 금액, 보유 자산을 기반으로 부족 자금을 계산하는 Tool.
     (DB 업데이트 없음, 순수 계산 전용)
     """
+
     # 내부 유틸: 안전한 정수 변환
     def _to_int(v: Any) -> int:
         try:
@@ -754,7 +790,9 @@ async def simulate_investment(
             return {
                 "months_needed": 0,
                 "total_balance": available_assets,
-                "monthly_invest": int(monthly_income * (income_usage_ratio / 100)),
+                "monthly_invest": int(
+                    monthly_income * (income_usage_ratio / 100)
+                ),
                 "saving_ratio": saving_ratio,
                 "fund_ratio": fund_ratio,
             }
@@ -774,8 +812,12 @@ async def simulate_investment(
         while total_balance < shortage and months < 600:
             months += 1
             # 월복리 적용 (연 수익률 -> 월 수익률 = r/12)
-            init_saving = (init_saving + saving_monthly) * (1 + saving_yield / 100.0 / 12.0)
-            init_fund = (init_fund + fund_monthly) * (1 + fund_yield / 100.0 / 12.0)
+            init_saving = (init_saving + saving_monthly) * (
+                1 + saving_yield / 100.0 / 12.0
+            )
+            init_fund = (init_fund + fund_monthly) * (
+                1 + fund_yield / 100.0 / 12.0
+            )
             total_balance = init_saving + init_fund
 
         return {
@@ -831,5 +873,246 @@ async def simulate_investment(
             success=False,
             simulation=None,
             inputs=None,
+            error=str(e),
+        )
+
+
+# 10. 비율(예금/적금/펀드)에 따른 금액 계산 (스키마 기반)
+@router.post(
+    "/calculate_portfolio_amounts",
+    summary="비율에 따른 금액 계산",
+    operation_id="calculate_portfolio_amounts",
+    response_model=CalculatePortfolioAmountsResponse,
+)
+async def api_calculate_portfolio_amounts(
+    payload: CalculatePortfolioAmountsRequest = Body(...),
+) -> CalculatePortfolioAmountsResponse:
+    """
+    총 자산과 비율(예: "30:40:30")을 입력받아
+    예금/적금/펀드 각각의 금액을 계산합니다.
+    """
+    total_amount = payload.total_amount
+    ratio_str = payload.ratio_str
+
+    try:
+        ratios = [int(n) for n in re.findall(r"\d+", ratio_str)]
+
+        if len(ratios) != 3:
+            return CalculatePortfolioAmountsResponse(
+                success=False,
+                amounts=None,
+                error="비율은 예금:적금:펀드 3개 숫자로 입력해주세요.",
+            )
+
+        total_ratio = sum(ratios) or 1
+
+        deposit_amt = int(total_amount * (ratios[0] / total_ratio))
+        savings_amt = int(total_amount * (ratios[1] / total_ratio))
+        fund_amt = int(total_amount * (ratios[2] / total_ratio))
+
+        # 자투리 금액 보정 (펀드에 합산)
+        diff = total_amount - (deposit_amt + savings_amt + fund_amt)
+        fund_amt += diff
+
+        return CalculatePortfolioAmountsResponse(
+            success=True,
+            amounts={
+                "deposit": deposit_amt,
+                "savings": savings_amt,
+                "fund": fund_amt,
+            },
+            error=None,
+        )
+    except Exception as e:
+        return CalculatePortfolioAmountsResponse(
+            success=False,
+            amounts=None,
+            error=str(e),
+        )
+
+
+# 11. 사용자가 선택한 예금/적금 금액이 한도(deposit_amount, savings_amount)를 초과하는지 검증
+@router.post(
+    "/validate_selected_savings_products",
+    summary="선택한 예금/적금 금액 검증",
+    operation_id="validate_selected_savings_products",
+    description=(
+        "예금/적금 추천 후 사용자가 선택한 상품과 각 상품별 입력 금액이\n"
+        "`/db/get_member_investment_amounts` Tool을 통해 조회한\n"
+        "**예금/적금 배정 가능 한도**(members 테이블의 `deposite_amount`, `saving_amount` 기반)가\n"
+        "초과되는지 검증합니다.\n\n"
+        "출력:\n"
+        "- success: 검증 성공 여부\n"
+        "- total_selected_deposit / total_selected_savings: 선택 금액 총합\n"
+        "- remaining_deposit_amount / remaining_savings_amount: 남은 한도(음수면 초과)\n"
+        "- violations: 초과/유효성 관련 메시지 리스트"
+    ),
+    response_model=ValidateSelectedSavingsProductsResponse,
+)
+async def validate_selected_savings_products(
+    payload: ValidateSelectedSavingsProductsRequest = Body(...),
+) -> ValidateSelectedSavingsProductsResponse:
+    """
+    - deposit_amount: (프론트/에이전트 입장에서는) 예금 배정 가능 총액.
+      실제 DB 컬럼은 members.deposite_amount 이며,
+      값은 `/db/get_member_investment_amounts`에서 변환되어 들어온다고 가정.
+    - savings_amount: 적금 배정 가능 총액 (DB 컬럼: members.saving_amount).
+    - selected_deposits: [SelectedProductAmount, ...]
+    - selected_savings: [SelectedProductAmount, ...]
+    를 받아 한도 초과 여부를 검증.
+    """
+
+    def _to_int_safe(v: Any) -> int:
+        try:
+            if v is None or v == "":
+                return 0
+            return int(float(v))
+        except Exception:
+            return 0
+
+    try:
+        # 🔹 Pydantic 모델 필드 사용
+        deposit_limit = _to_int_safe(payload.deposit_amount)
+        savings_limit = _to_int_safe(payload.savings_amount)
+
+        selected_deposits = payload.selected_deposits or []
+        selected_savings = payload.selected_savings or []
+
+        violations: List[str] = []
+
+        # 개별 금액 음수/0 체크 및 총합 계산
+        total_selected_deposit = 0
+        for item in selected_deposits:
+            name = item.product_name or "예금상품"
+            amt = _to_int_safe(item.amount)
+            if amt < 0:
+                violations.append(
+                    f"예금 상품 '{name}'의 금액이 음수입니다: {amt}원"
+                )
+            total_selected_deposit += max(0, amt)
+
+        total_selected_savings = 0
+        for item in selected_savings:
+            name = item.product_name or "적금상품"
+            amt = _to_int_safe(item.amount)
+            if amt < 0:
+                violations.append(
+                    f"적금 상품 '{name}'의 금액이 음수입니다: {amt}원"
+                )
+            total_selected_savings += max(0, amt)
+
+        remaining_deposit = deposit_limit - total_selected_deposit
+        remaining_savings = savings_limit - total_selected_savings
+
+        # 한도 음수/미설정 방어
+        if deposit_limit < 0:
+            violations.append(
+                f"예금 한도(deposit_amount)가 0보다 작습니다: {deposit_limit}원"
+            )
+        if savings_limit < 0:
+            violations.append(
+                f"적금 한도(savings_amount)가 0보다 작습니다: {savings_limit}원"
+            )
+
+        # 한도 초과 체크
+        if total_selected_deposit > deposit_limit:
+            violations.append(
+                f"선택한 예금 총액({total_selected_deposit:,}원)이 "
+                f"예금 한도({deposit_limit:,}원)를 초과했습니다."
+            )
+        if total_selected_savings > savings_limit:
+            violations.append(
+                f"선택한 적금 총액({total_selected_savings:,}원)이 "
+                f"적금 한도({savings_limit:,}원)를 초과했습니다."
+            )
+
+        success = len(violations) == 0
+
+        return ValidateSelectedSavingsProductsResponse(
+            success=success,
+            deposit_amount=deposit_limit,
+            savings_amount=savings_limit,
+            total_selected_deposit=total_selected_deposit,
+            total_selected_savings=total_selected_savings,
+            remaining_deposit_amount=remaining_deposit,
+            remaining_savings_amount=remaining_savings,
+            violations=violations,
+            error=None,
+        )
+
+    except Exception as e:
+        logger.error(
+            f"validate_selected_savings_products Error: {e}", exc_info=True
+        )
+        return ValidateSelectedSavingsProductsResponse(
+            success=False,
+            deposit_amount=payload.deposit_amount,
+            savings_amount=payload.savings_amount,
+            total_selected_deposit=0,
+            total_selected_savings=0,
+            remaining_deposit_amount=0,
+            remaining_savings_amount=0,
+            violations=[],
+            error=str(e),
+        )
+
+
+@router.post(
+    "/validate_selected_funds_products",
+    summary="선택 펀드 금액 검증",
+    operation_id="validate_selected_funds_products",
+    description=(
+        "펀드 추천 후 사용자가 선택한 펀드들의 총합이\n"
+        "`/db/get_member_investment_amounts` Tool로 조회한 "
+        "**펀드 배정 가능 한도**(members.fund_amount 기반)를 초과하는지 검증합니다."
+    ),
+    response_model=ValidateSelectedFundsProductsResponse,
+)
+async def validate_selected_funds_products(
+    payload: ValidateSelectedFundsProductsRequest = Body(...),
+) -> ValidateSelectedFundsProductsResponse:
+    """
+    - fund_amount: 펀드 배정 가능 총액 (실제 DB 컬럼: members.fund_amount).
+      값은 `/db/get_member_investment_amounts` Tool을 통해 미리 조회되어 들어온다고 가정.
+    - selected_funds: [SelectedFundAmount, ...]
+    """
+    try:
+        fund_limit = int(payload.fund_amount or 0)
+        total_selected = sum(int(f.amount or 0) for f in payload.selected_funds)
+
+        remaining = fund_limit - total_selected
+        violations: List[str] = []
+
+        if total_selected <= 0:
+            violations.append(
+                "선택한 펀드 금액이 0원입니다. 최소 1원 이상 입력해 주세요."
+            )
+
+        if total_selected > fund_limit:
+            violations.append(
+                f"선택한 펀드 총액({total_selected:,}원)가 "
+                f"펀드 한도({fund_limit:,}원)를 초과합니다."
+            )
+
+        success = len(violations) == 0
+
+        return ValidateSelectedFundsProductsResponse(
+            success=success,
+            fund_amount=fund_limit,
+            total_selected_fund=total_selected,
+            remaining_fund_amount=remaining,
+            violations=violations,
+            error=None,
+        )
+    except Exception as e:
+        logger.error(
+            f"validate_selected_funds_products Error: {e}", exc_info=True
+        )
+        return ValidateSelectedFundsProductsResponse(
+            success=False,
+            fund_amount=0,
+            total_selected_fund=0,
+            remaining_fund_amount=0,
+            violations=[],
             error=str(e),
         )

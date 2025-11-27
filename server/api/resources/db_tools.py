@@ -1,8 +1,8 @@
 import os
 import logging
-from typing import Any, Dict
 import pandas as pd
-from typing import Dict, Any
+from typing import Dict, Any, List
+from datetime import date
 
 from fastapi import APIRouter, Body
 from sqlalchemy import create_engine, text
@@ -26,6 +26,14 @@ from server.schemas.plan_schema import (
     GetUserProfileForFundResponse,
     AddMyProductRequest,
     AddMyProductResponse,
+    AddMyFundRequest,
+    AddMyFundResponse,
+    GetMemberInvestmentAmountsRequest,
+    GetMemberInvestmentAmountsResponse,
+    SaveSelectedSavingsProductsRequest,
+    SaveSelectedSavingsProductsResponse,
+    SaveSelectedFundsProductsRequest,
+    SaveSelectedFundsProductsResponse,
 )
 
 # ----------------------------------
@@ -233,8 +241,11 @@ async def update_loan_result(
     """
     LoanAgent.update_db와 동일한 동작을 HTTP Tool로 노출한 버전.
     - plans.loan_amount, plans.product_id
-    - members.shortage_amount (+ dsr, dti 선택 업데이트)
+    - members.shortage_amount
     를 한 번에 업데이트한다.
+
+    ⚠️ 주의: 현재 members 테이블에는 dsr/dti 컬럼이 없으므로,
+    dsr/dti 값은 DB에 저장하지 않고 응답으로만 반환한다.
     """
     try:
         user_id = payload.user_id or 1
@@ -291,18 +302,16 @@ async def update_loan_result(
                 },
             )
 
-            # 3) members.shortage_amount + dsr + dti 업데이트
+            # 3) members.shortage_amount 업데이트
             conn.execute(
                 text(
                     """
                     UPDATE members
-                    SET shortage_amount = :s,
-                        dsr = COALESCE(:dsr, dsr),
-                        dti = COALESCE(:dti, dti)
+                    SET shortage_amount = :s
                     WHERE user_id = :uid
                 """
                 ),
-                {"s": shortage_amount, "dsr": dsr, "dti": dti, "uid": user_id},
+                {"s": shortage_amount, "uid": user_id},
             )
 
         logger.info(
@@ -346,16 +355,14 @@ async def api_get_user_loan_overview(
 
     try:
         with engine.connect() as conn:
+            # 1) 기본 정보: members + plans + loan_product
             query = text(
                 """
                 SELECT 
-                    m.user_name,
-                    m.salary,
+                    m.name AS name,
                     m.income_usage_ratio,
                     m.initial_prop,
                     m.hope_price,
-                    m.dsr,
-                    m.dti,
                     p.loan_amount,
                     p.product_id,
                     l.product_name,
@@ -379,8 +386,31 @@ async def api_get_user_loan_overview(
 
             data = dict(row)
 
+            # 2) members_info에서 최신 연월 기준 salary/DSR/DTI 보정
+            mi_row = conn.execute(
+                text(
+                    """
+                    SELECT annual_salary, DTI, DSR
+                    FROM members_info
+                    WHERE user_id = :uid
+                    ORDER BY year_month DESC
+                    LIMIT 1
+                    """
+                ),
+                {"uid": user_id},
+            ).mappings().first()
+
+            if mi_row:
+                data["salary"] = mi_row.get("annual_salary")
+                data["dti"] = mi_row.get("DTI")
+                data["dsr"] = mi_row.get("DSR")
+            else:
+                data["salary"] = None
+                data["dti"] = None
+                data["dsr"] = None
+
             # product_name이 비어 있고 product_id만 있는 경우 보정
-            if not data.get("product_name") and data.get("product_id"):
+            if (not data.get("product_name")) and data.get("product_id"):
                 extra = conn.execute(
                     text(
                         """
@@ -513,105 +543,116 @@ async def api_save_summary_report(
             )
 
         logger.info(f"✅ summary_report 저장 완료 (user_id={user_id}, plan_id={plan_id})")
-        return {
-            "tool_name": "save_summary_report",
-            "success": True,
-            "user_id": user_id,
-        }
+        return SaveSummaryReportResponse(
+            success=True,
+            user_id=user_id,
+        )
 
     except Exception as e:
         logger.error(f"save_summary_report Error: {e}", exc_info=True)
-        return {
-            "tool_name": "save_summary_report",
-            "success": False,
-            "user_id": payload.get("user_id", 1),
-            "error": str(e),
-        }
+        return SaveSummaryReportResponse(
+            success=False,
+            user_id=payload.user_id or 1,
+            error=str(e),
+        )
 
 
 # ============================================================
-# 7. # 사용자 투자 성향 조회
+# 7. 사용자 투자 성향 조회 (스키마 기반으로 정리)
 # ============================================================
 @router.post(
     "/get_user_profile_for_fund",
     summary="사용자 투자 성향 조회",
     operation_id="get_user_profile_for_fund",
-    description=(
-        "members 테이블에서 user_id를 기준으로 사용자의 투자 성향(invest_tendency)을 조회합니다.\n\n"
-        "입력 필드 예시:\n"
-        "- user_id: 사용자 ID (숫자 또는 문자열)\n\n"
-        "출력 필드:\n"
-        "- success: 조회 성공 여부(Boolean)\n"
-        "- user_id: 조회된 사용자 ID\n"
-        "- invest_tendency: 투자 성향 (값이 없으면 에러 반환)\n"
-        "- error: 오류 메시지(실패 시)"
-    ),
-    response_model=dict,
+    response_model=GetUserProfileForFundResponse,
 )
 async def api_get_user_profile_for_fund(
-    payload: Dict[str, Any] = Body(...)
-) -> dict:
+    payload: GetUserProfileForFundRequest = Body(...),
+) -> GetUserProfileForFundResponse:
     """
     members 테이블에서 사용자의 투자 성향을 조회하는 Tool.
+    - 이름: members.name
+    - 나이: members.birth_date 기준으로 계산
     """
-    user_id = payload.get("user_id")
+    user_id = payload.user_id
 
-    # 1. 입력값 검증
     if not user_id:
-        return {
-            "tool_name": "get_user_profile_for_fund",
-            "success": True,
-            "error": "입력값에 'user_id'가 누락되었습니다.",
-        }
+        return GetUserProfileForFundResponse(
+            success=False,
+            user_id=user_id,
+            name=None,
+            age=None,
+            invest_tendency=None,
+            error="입력값에 'user_id'가 누락되었습니다.",
+        )
 
     try:
         with engine.connect() as conn:
-            # 2. DB 조회
-            query = text("""
-                SELECT user_name, age, invest_tendency
+            query = text(
+                """
+                SELECT name, birth_date, invest_tendency
                 FROM members
                 WHERE user_id = :uid
                 LIMIT 1
-            """)
+                """
+            )
             result = conn.execute(query, {"uid": user_id}).fetchone()
-            
-            # 3. 결과 검증
-            if not result:
-                # (Case A) 해당 user_id가 DB에 없는 경우
-                return {
-                    "tool_name": "get_user_profile_for_fund",
-                    "success": False,
-                    "error": f"ID가 '{user_id}'인 사용자를 찾을 수 없습니다."
-                }
-            
-            user_name, age, invest_tendency = result
-            
-            if not invest_tendency:
-                # (Case B) 사용자는 있는데 투자 성향이 NULL/빈 값인 경우
-                # -> 펀드 추천 불가능하므로 에러 반환
-                return {
-                    "tool_name": "get_user_profile_for_fund",
-                    "success": False,
-                    "error": f"사용자('{user_name}')의 투자 성향 정보가 없습니다. 먼저 투자 성향 분석을 진행해주세요."
-                }
 
-            # 4. 성공 시 정보 반환
-            return {
-                "tool_name": "get_user_profile_for_fund",
-                "success": True,
-                "user_id": user_id,
-                "user_name": user_name,
-                "age": age,
-                "invest_tendency": invest_tendency
-            }
+            if not result:
+                return GetUserProfileForFundResponse(
+                    success=False,
+                    user_id=user_id,
+                    name=None,
+                    age=None,
+                    invest_tendency=None,
+                    error=f"ID가 '{user_id}'인 사용자를 찾을 수 없습니다.",
+                )
+
+            name, birth_date, invest_tendency = result
+
+            # birth_date 기반 나이 계산
+            if birth_date:
+                today = date.today()
+                age = (
+                    today.year
+                    - birth_date.year
+                    - ((today.month, today.day) < (birth_date.month, birth_date.day))
+                )
+            else:
+                age = None
+
+            if not invest_tendency:
+                return GetUserProfileForFundResponse(
+                    success=False,
+                    user_id=user_id,
+                    name=name,
+                    age=age,
+                    invest_tendency=None,
+                    error=(
+                        f"사용자('{name}')의 투자 성향 정보가 없습니다. "
+                        "먼저 투자 성향 분석을 진행해주세요."
+                    ),
+                )
+
+            return GetUserProfileForFundResponse(
+                success=True,
+                user_id=user_id,
+                name=name,
+                age=age,
+                invest_tendency=invest_tendency,
+                error=None,
+            )
 
     except Exception as e:
         logger.error(f"get_user_profile_for_fund Error: {e}", exc_info=True)
-        return {
-            "tool_name": "get_user_profile_for_fund",
-            "success": False,
-            "error": f"DB 조회 중 오류 발생: {str(e)}",
-        }
+        return GetUserProfileForFundResponse(
+            success=False,
+            user_id=user_id,
+            name=None,
+            age=None,
+            invest_tendency=None,
+            error=f"DB 조회 중 오류 발생: {str(e)}",
+        )
 
 
 # ============================================================
@@ -624,14 +665,14 @@ async def api_get_user_profile_for_fund(
     response_model=dict,
 )
 async def api_get_ml_ranked_funds(
-    payload: Dict[str, Any] = Body(...)
+    payload: Dict[str, Any] = Body(...),
 ) -> dict:
     """
     DB의 fund_ranking_snapshot 테이블에서 성향에 맞는 펀드를 조회하는 Tool.
     """
     # 1. 입력값 추출
     invest_tendency = payload.get("invest_tendency")
-    sort_by = payload.get("sort_by", "score") # 기본값: 종합 점수(score)
+    sort_by = payload.get("sort_by", "score")  # 기본값: 종합 점수(score)
 
     # 2. [Validation] 필수 값 확인
     if not invest_tendency:
@@ -639,117 +680,131 @@ async def api_get_ml_ranked_funds(
             "tool_name": "get_ml_ranked_funds",
             "success": False,
             "funds": [],
-            "error": "입력값에 'invest_tendency'(투자성향)가 누락되었습니다."
+            "error": "입력값에 'invest_tendency'(투자성향)가 누락되었습니다.",
         }
 
     # [설정] 투자 성향별 허용 등급 매핑
     investor_style_to_grades = {
-        '공격투자형': ["매우 높은 위험", "높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
-        '적극투자형': ["매우 높은 위험", "높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험"],
-        '위험중립형': ["높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험"],
-        '안정추구형': ["다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
-        '안정형': ["보통 위험", "낮은 위험", "매우 낮은 위험"]
+        "공격투자형": [
+            "매우 높은 위험",
+            "높은 위험",
+            "다소 높은 위험",
+            "보통 위험",
+            "낮은 위험",
+            "매우 낮은 위험",
+        ],
+        "적극투자형": [
+            "매우 높은 위험",
+            "높은 위험",
+            "다소 높은 위험",
+            "보통 위험",
+            "낮은 위험",
+        ],
+        "위험중립형": ["높은 위험", "다소 높은 위험", "보통 위험", "낮은 위험"],
+        "안정추구형": ["다소 높은 위험", "보통 위험", "낮은 위험", "매우 낮은 위험"],
+        "안정형": ["보통 위험", "낮은 위험", "매우 낮은 위험"],
     }
 
     # 3. [Validation] 유효한 투자 성향인지 확인 (Fail-Fast)
     if invest_tendency not in investor_style_to_grades:
-        # 정의되지 않은 성향이 들어오면 즉시 에러 반환
         return {
             "tool_name": "get_ml_ranked_funds",
             "success": False,
             "funds": [],
-            "error": f"잘못된 투자 성향입니다: '{invest_tendency}'. (허용된 값: {list(investor_style_to_grades.keys())})"
+            "error": (
+                f"잘못된 투자 성향입니다: '{invest_tendency}'. "
+                f"(허용된 값: {list(investor_style_to_grades.keys())})"
+            ),
         }
-    
-    # 유효하다면 허용 등급 가져오기
+
     allowed_risks = investor_style_to_grades[invest_tendency]
 
-    # 4. 정렬 기준 매핑 (DB 한글 컬럼명 <-> 정렬 키워드)
+    # 4. 정렬 기준 매핑
     sort_column_map = {
         "score": "최종_종합품질점수",
         "yield_1y": "1년_수익률",
         "yield_3m": "3개월_수익률",
         "volatility": "1년_변동성",
         "fee": "총보수(%)",
-        "size": "운용_규모(억)"
+        "size": "운용_규모(억)",
     }
-    
-    # 정렬 컬럼 결정 (매핑 안 되면 기본값 '최종_종합품질점수')
+
     db_sort_col = sort_column_map.get(sort_by, "최종_종합품질점수")
-    
-    # 오름차순 정렬이 필요한 항목 (낮을수록 좋은 것: 변동성, 수수료)
-    ascending_sort_keys = ['volatility', 'fee']
+
+    # 오름차순 정렬이 필요한 항목
+    ascending_sort_keys = ["volatility", "fee"]
     is_ascending = True if sort_by in ascending_sort_keys else False
 
     try:
         # 5. DB 조회
         query = "SELECT * FROM fund_ranking_snapshot"
         df = pd.read_sql(query, engine)
-        
-        if df.empty:
-             return {
-                 "tool_name": "get_ml_ranked_funds", 
-                 "success": True, 
-                 "funds": [],
-                 "error": "펀드 데이터베이스가 비어 있습니다."
-             }
 
-        # 띄어쓰기 무시를 위한 정규화 (DB 데이터 전처리)
-        df['risk_normalized'] = df['위험등급'].astype(str).str.replace(" ", "").str.strip()
-        
+        if df.empty:
+            return {
+                "tool_name": "get_ml_ranked_funds",
+                "success": True,
+                "funds": [],
+                "error": "펀드 데이터베이스가 비어 있습니다.",
+            }
+
+        # 띄어쓰기 무시를 위한 정규화
+        df["risk_normalized"] = (
+            df["위험등급"].astype(str).str.replace(" ", "").str.strip()
+        )
+
         final_list = []
-        
+
         # 6. 등급별 Top 2 선별
         for risk in allowed_risks:
-            # 검색 키워드도 공백 제거
             search_key = risk.replace(" ", "").strip()
-            
-            # (1) 해당 등급 필터링 
-            # (2) 점수 없는 행 제외(dropna) 
-            # (3) 정렬 기준(db_sort_col)으로 정렬 
-            # (4) 상위 2개 추출
-            group_df = df[df['risk_normalized'] == search_key].dropna(subset=['최종_종합품질점수']).sort_values(
-                by=db_sort_col, ascending=is_ascending
-            ).head(2)
-            
+
+            group_df = (
+                df[df["risk_normalized"] == search_key]
+                .dropna(subset=["최종_종합품질점수"])
+                .sort_values(by=db_sort_col, ascending=is_ascending)
+                .head(2)
+            )
+
             for _, row in group_df.iterrows():
                 fund_data = {
-                    # --- 기본 정보 ---
-                    "product_name": row['펀드명'],
-                    "risk_level": row['위험등급'],
-                    "description": str(row.get('설명', ''))[:500] + "..." if row.get('설명') else "설명 없음",
-                    
-                    # --- 점수 정보 (0~100점 스케일) ---
-                    "final_quality_score": round(row['최종_종합품질점수'], 1),
-                    "perf_score": round(row['종합_성과_점수'], 1),    
-                    "stab_score": round(row['종합_안정성_점수'], 1),
-                    
-                    # --- 근거 데이터 (Evidence) - DB 한글 컬럼 매핑 ---
+                    "product_name": row["펀드명"],
+                    "risk_level": row["위험등급"],
+                    "description": (
+                        str(row.get("설명", ""))[:500] + "..."
+                        if row.get("설명")
+                        else "설명 없음"
+                    ),
+                    "final_quality_score": round(row["최종_종합품질점수"], 1),
+                    "perf_score": round(row["종합_성과_점수"], 1),
+                    "stab_score": round(row["종합_안정성_점수"], 1),
                     "evidence": {
-                        "return_1y": row.get('1년_수익률', 0),
-                        "return_3m": row.get('3개월_수익률', 0),
-                        "total_fee": row.get('총보수(%)', 0),
-                        "fund_size": row.get('운용_규모(억)', 0),
-                        "volatility_1y": row.get('1년_변동성', 0),
-                        "mdd_1y": row.get('최대_손실_낙폭(MDD)', 0)
-                    }
+                        "return_1y": row.get("1년_수익률", 0),
+                        "return_3m": row.get("3개월_수익률", 0),
+                        "total_fee": row.get("총보수(%)", 0),
+                        "fund_size": row.get("운용_규모(억)", 0),
+                        "volatility_1y": row.get("1년_변동성", 0),
+                        "mdd_1y": row.get("최대_손실_낙폭(MDD)", 0),
+                    },
                 }
                 final_list.append(fund_data)
-        
+
         if not final_list:
             return {
                 "tool_name": "get_ml_ranked_funds",
-                "success": True, # 로직은 성공했으나 결과가 없는 경우
+                "success": True,
                 "funds": [],
-                "error": "조건에 맞는 펀드를 찾을 수 없습니다." # (DB에 데이터가 부족할 때)
+                "error": "조건에 맞는 펀드를 찾을 수 없습니다.",
             }
 
-        logger.info(f"Invest tendency '{invest_tendency}' (Sort: {sort_by}) -> Found {len(final_list)} funds.")
-        
+        logger.info(
+            f"Invest tendency '{invest_tendency}' (Sort: {sort_by}) -> Found {len(final_list)} funds."
+        )
+
         return {
             "tool_name": "get_ml_ranked_funds",
             "success": True,
-            "funds": final_list
+            "funds": final_list,
         }
 
     except Exception as e:
@@ -758,80 +813,659 @@ async def api_get_ml_ranked_funds(
             "tool_name": "get_ml_ranked_funds",
             "success": False,
             "funds": [],
-            "error": f"DB 조회 중 오류 발생: {str(e)}"
+            "error": f"DB 조회 중 오류 발생: {str(e)}",
         }
-    
+
 
 # ============================================================
-# 9. 펀드 가입 처리 (my_products 테이블 적재)
+# 9. 펀드 가입 처리 (my_products + my_fund_details 적재)
 # ============================================================
 @router.post(
     "/add_my_product",
-    summary="사용자 펀드 가입 처리",
+    summary="사용자 펀드 가입 처리 (상세정보 자동 생성)",
     operation_id="add_my_product",
-    description=(
-        "사용자가 선택한 펀드 상품을 'my_products' 테이블에 저장하여 가입 처리합니다.\n\n"
-        "입력 필드 예시:\n"
-        "- user_id: 사용자 ID (필수)\n"
-        "- product_name: 펀드 상품명 (필수)\n"
-        "- product_type: 상품 유형 (기본값: '펀드')\n"
-        "- product_description: 펀드 설명 (선택 사항)\n"
-    ),
+    description="사용자가 선택한 펀드 상품을 가입 처리합니다.",
+    response_model=AddMyFundResponse,
+)
+async def api_add_my_fund(
+    payload: AddMyFundRequest = Body(...),
+) -> AddMyFundResponse:
+    # 1. 입력값 추출
+    user_id = payload.user_id
+    product_name = payload.product_name
+    principal_amount = payload.principal_amount
+    product_description = payload.product_description
+
+    # 🔹 DB ENUM('예금','적금','펀드') 와 일치하도록
+    product_type = "펀드"
+
+    if not user_id or not product_name:
+        return AddMyFundResponse(
+            success=False,
+            product_id=None,
+            message=None,
+            error="user_id와 product_name은 필수입니다.",
+        )
+
+    try:
+        with engine.begin() as conn:
+            # 기준가 조회
+            price_query = text(
+                """
+                SELECT 기준가 as base_price 
+                FROM fund_ranking_snapshot 
+                WHERE 펀드명 = :pname 
+                ORDER BY 날짜 DESC 
+                LIMIT 1
+            """
+            )
+            price_row = conn.execute(
+                price_query, {"pname": product_name}
+            ).fetchone()
+
+            if not price_row:
+                raise ValueError(
+                    f"'{product_name}' 펀드의 기준가 정보를 찾을 수 없습니다."
+                )
+
+            current_base_price = price_row[0]
+
+            # my_products INSERT
+            # 스키마: product_id, user_id, product_name, product_type,
+            #        product_description, current_value,
+            #        preferential_interest_rate, end_date,
+            #        created_at, is_ended
+            insert_product_query = text(
+                """
+                INSERT INTO my_products 
+                (user_id, product_name, product_type, product_description,
+                 current_value, preferential_interest_rate, end_date,
+                 created_at, is_ended)
+                VALUES 
+                (:uid, :pname, :ptype, :pdesc,
+                 :curr_val, NULL, NULL,
+                 NOW(), 0)
+            """
+            )
+
+            result = conn.execute(
+                insert_product_query,
+                {
+                    "uid": user_id,
+                    "pname": product_name,
+                    "ptype": product_type,
+                    "pdesc": product_description,
+                    "curr_val": principal_amount,
+                },
+            )
+
+            new_product_id = result.lastrowid
+
+            # my_fund_details INSERT (스키마는 기존대로 유지한다고 가정)
+            insert_detail_query = text(
+                """
+                INSERT INTO my_fund_details
+                (product_id, fund_name, start_base_price)
+                VALUES
+                (:pid, :pname, :start_price)
+            """
+            )
+
+            conn.execute(
+                insert_detail_query,
+                {
+                    "pid": new_product_id,
+                    "pname": product_name,
+                    "start_price": current_base_price,
+                },
+            )
+
+        logger.info(
+            f"User {user_id} joined fund '{product_name}' "
+            f"(Start Price: {current_base_price}, Amount: {principal_amount})"
+        )
+
+        return AddMyFundResponse(
+            success=True,
+            product_id=new_product_id,
+            message=(
+                f"'{product_name}' 가입 완료! "
+                f"(투자금: {principal_amount:,}원, 시작가: {current_base_price:,}원)"
+            ),
+            error=None,
+        )
+
+    except ValueError as ve:
+        logger.warning(f"add_my_product Warning: {ve}")
+        return AddMyFundResponse(
+            success=False,
+            product_id=None,
+            message=None,
+            error=str(ve),
+        )
+    except Exception as e:
+        logger.error(f"add_my_product Error: {e}", exc_info=True)
+        return AddMyFundResponse(
+            success=False,
+            product_id=None,
+            message=None,
+            error=f"DB 저장 실패: {str(e)}",
+        )
+
+
+# ============================================================
+# 10. 투자 성향별 추천 비율 조회
+# ============================================================
+@router.post(
+    "/get_investment_ratio",
+    summary="투자 성향별 추천 비율 조회",
+    operation_id="get_investment_ratio",
     response_model=dict,
 )
-async def api_add_my_product(
-    payload: Dict[str, Any] = Body(...)
+async def api_get_investment_ratio(
+    payload: Dict[str, Any] = Body(...),
 ) -> dict:
     """
-    사용자가 선택한 펀드를 my_products 테이블에 INSERT하는 Tool.
-    (필수 컬럼만 입력받아 처리합니다.)
+    investment_ratio_recommendation 테이블에서 성향별 포트폴리오 비율 조회 Tool.
     """
-    user_id = payload.get("user_id")
-    product_name = payload.get("product_name")
-    product_type = payload.get("product_type", "펀드")
-    product_description = payload.get("product_description", "")
-    
-    # NOT NULL 컬럼에 대한 기본값 처리
-    # 예: current_value, start_date 등 필수 컬럼이 있다면 여기서 기본값을 넣어주세요.
-    # current_value = 0 
-    # start_date = datetime.now()
+    invest_tendency = payload.get("invest_tendency")
 
-    # 1. 필수값 검증
-    if not user_id or not product_name:
+    if not invest_tendency:
         return {
-            "tool_name": "add_my_product",
+            "tool_name": "get_investment_ratio",
             "success": False,
-            "error": "user_id와 product_name은 필수입니다."
+            "error": "입력값에 'invest_tendency'(투자성향)가 누락되었습니다.",
         }
 
     try:
-        with engine.begin() as conn: # 트랜잭션 시작
-            # 2. INSERT 쿼리 실행 (지정한 컬럼만)
-            # (나머지 컬럼은 DB 설정상 NULL 허용이거나 Default가 있어야 함)
-            query = text("""
-                INSERT INTO my_products (user_id, product_name, product_type, product_description)
-                VALUES (:uid, :pname, :ptype, :pdesc)
-            """)
-            
-            conn.execute(query, {
-                "uid": user_id,
-                "pname": product_name,
-                "ptype": product_type,
-                "pdesc": product_description
-            })
+        with engine.connect() as conn:
+            query = text(
+                """
+                SELECT deposit_ratio, savings_ratio, fund_ratio, core_logic
+                FROM investment_ratio_recommendation
+                WHERE invest_tendency = :tendency
+                LIMIT 1
+            """
+            )
+            row = conn.execute(query, {"tendency": invest_tendency}).fetchone()
 
-        logger.info(f"User {user_id} added fund '{product_name}' to my_products.")
+            if not row:
+                return {
+                    "tool_name": "get_investment_ratio",
+                    "success": False,
+                    "error": (
+                        f"DB에 '{invest_tendency}' 성향에 대한 추천 비율 데이터가 없습니다. "
+                        "(오타 확인 필요)"
+                    ),
+                }
+
+            return {
+                "tool_name": "get_investment_ratio",
+                "success": True,
+                "invest_tendency": invest_tendency,
+                "recommended_ratios": {
+                    "deposit": row[0],
+                    "savings": row[1],
+                    "fund": row[2],
+                },
+                "core_logic": row[3],
+            }
+
+    except Exception as e:
+        logger.error(f"get_investment_ratio Error: {e}", exc_info=True)
+        return {
+            "tool_name": "get_investment_ratio",
+            "success": False,
+            "error": f"DB 조회 중 오류 발생: {str(e)}",
+        }
+
+
+# ============================================================
+# 11. [Portfolio] 자산 배분 결과 저장
+# ============================================================
+@router.post(
+    "/save_user_portfolio",
+    summary="사용자 자산 배분 금액 저장",
+    operation_id="save_user_portfolio",
+    response_model=dict,
+)
+async def api_save_user_portfolio(
+    payload: Dict[str, Any] = Body(...),
+) -> dict:
+    """
+    사용자가 결정한 예금/적금/펀드 배분 금액을 members 테이블에 저장합니다.
+    - 스키마 기준 컬럼명:
+      deposite_amount, saving_amount, fund_amount
+    """
+    user_id = payload.get("user_id")
+
+    deposit = payload.get("deposit_amount")
+    savings = payload.get("savings_amount")
+    fund = payload.get("fund_amount")
+
+    if not user_id:
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": "user_id는 필수입니다.",
+        }
+
+    if deposit is None or savings is None or fund is None:
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": "deposit_amount, savings_amount, fund_amount 값이 모두 필요합니다.",
+        }
+
+    if deposit < 0 or savings < 0 or fund < 0:
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": "자산 배분 금액은 음수일 수 없습니다.",
+        }
+
+    try:
+        with engine.begin() as conn:
+            check_user = conn.execute(
+                text("SELECT 1 FROM members WHERE user_id=:uid"),
+                {"uid": user_id},
+            ).scalar()
+            if not check_user:
+                return {
+                    "tool_name": "save_user_portfolio",
+                    "success": False,
+                    "error": f"존재하지 않는 사용자 ID({user_id})입니다.",
+                }
+
+            conn.execute(
+                text(
+                    """
+                    UPDATE members 
+                    SET deposite_amount=:d, saving_amount=:s, fund_amount=:f
+                    WHERE user_id=:uid
+                """
+                ),
+                {"d": deposit, "s": savings, "f": fund, "uid": user_id},
+            )
+
+        logger.info(
+            f"Portfolio saved for User {user_id}: D={deposit}, S={savings}, F={fund}"
+        )
 
         return {
-            "tool_name": "add_my_product",
+            "tool_name": "save_user_portfolio",
             "success": True,
-            "message": f"'{product_name}' 상품 가입이 완료되었습니다."
+            "message": "자산 배분 금액이 정상적으로 저장되었습니다.",
         }
 
     except Exception as e:
-        logger.error(f"add_my_product Error: {e}", exc_info=True)
+        logger.error(f"save_user_portfolio Error: {e}", exc_info=True)
         return {
-            "tool_name": "add_my_product",
+            "tool_name": "save_user_portfolio",
             "success": False,
-            "error": f"DB 저장 실패: {str(e)}"
+            "error": f"DB 저장 실패: {str(e)}",
         }
+
+
+# ============================================================
+# 12. [Portfolio] 예금/적금/펀드 보유 금액 조회
+# ============================================================
+@router.post(
+    "/get_member_investment_amounts",
+    summary="사용자 예금/적금/펀드 금액 조회",
+    operation_id="get_member_investment_amounts",
+    response_model=GetMemberInvestmentAmountsResponse,
+)
+async def api_get_member_investment_amounts(
+    payload: GetMemberInvestmentAmountsRequest = Body(...),
+) -> GetMemberInvestmentAmountsResponse:
+    """
+    members 테이블에서 특정 사용자의 예금/적금/펀드 금액을 조회하는 Tool.
+    - DB 컬럼: deposite_amount, saving_amount, fund_amount
+    - 응답 필드명: deposit_amount, savings_amount, fund_amount
+    """
+    user_id = payload.user_id
+
+    if not user_id:
+        return GetMemberInvestmentAmountsResponse(
+            success=False,
+            user_id=0,
+            deposit_amount=0,
+            savings_amount=0,
+            fund_amount=0,
+            error="입력값에 'user_id'가 누락되었습니다.",
+        )
+
+    try:
+        with engine.connect() as conn:
+            query = text(
+                """
+                SELECT deposite_amount, saving_amount, fund_amount
+                FROM members
+                WHERE user_id = :uid
+                LIMIT 1
+            """
+            )
+            row = conn.execute(query, {"uid": user_id}).fetchone()
+
+            if not row:
+                return GetMemberInvestmentAmountsResponse(
+                    success=False,
+                    user_id=user_id,
+                    deposit_amount=0,
+                    savings_amount=0,
+                    fund_amount=0,
+                    error=f"user_id={user_id} 를 가진 회원을 찾을 수 없습니다.",
+                )
+
+            deposit_amount = row[0] if row[0] is not None else 0
+            savings_amount = row[1] if row[1] is not None else 0
+            fund_amount = row[2] if row[2] is not None else 0
+
+        return GetMemberInvestmentAmountsResponse(
+            success=True,
+            user_id=user_id,
+            deposit_amount=deposit_amount,
+            savings_amount=savings_amount,
+            fund_amount=fund_amount,
+            error=None,
+        )
+
+    except Exception as e:
+        logger.error(f"get_member_investment_amounts Error: {e}", exc_info=True)
+        return GetMemberInvestmentAmountsResponse(
+            success=False,
+            user_id=user_id,
+            deposit_amount=0,
+            savings_amount=0,
+            fund_amount=0,
+            error=f"DB 조회 중 오류 발생: {str(e)}",
+        )
+
+
+# ============================================================
+# 13. [Saving] 선택한 예금/적금 상품을 my_products에 저장
+# ============================================================
+@router.post(
+    "/save_selected_savings_products",
+    summary="선택한 예금/적금 상품을 my_products에 저장",
+    operation_id="save_selected_savings_products",
+    response_model=SaveSelectedSavingsProductsResponse,
+)
+async def api_save_selected_savings_products(
+    payload: SaveSelectedSavingsProductsRequest = Body(...),
+) -> SaveSelectedSavingsProductsResponse:
+    """
+    saving_agent에서 최종으로 선택한 예금/적금 상품을
+    my_products 테이블에 여러 건 INSERT 하는 Tool.
+
+    my_products 스키마:
+    - product_id BIGINT AUTO_INCREMENT PRIMARY KEY
+    - user_id BIGINT
+    - product_name VARCHAR(80)
+    - product_type ENUM('예금','적금','펀드')
+    - product_description VARCHAR(255)
+    - current_value BIGINT
+    - preferential_interest_rate DOUBLE
+    - end_date DATETIME
+    - created_at DATETIME
+    - is_ended BOOLEAN
+    """
+    user_id = payload.user_id
+    selected_deposits = payload.selected_deposits or []
+    selected_savings = payload.selected_savings or []
+
+    if not user_id:
+        return SaveSelectedSavingsProductsResponse(
+            success=False,
+            user_id=0,
+            inserted_count=0,
+            products=[],
+            error="user_id는 필수입니다.",
+        )
+
+    inserted_products: List[Dict[str, Any]] = []
+
+    try:
+        with engine.begin() as conn:
+            # (A) 예금
+            for item in selected_deposits:
+                pname = item.product_name
+                amount = item.amount
+                end_date = item.end_date
+
+                if not pname or amount is None:
+                    logger.warning(
+                        f"[save_selected_savings_products] 잘못된 예금 항목: {item}"
+                    )
+                    continue
+
+                try:
+                    amount = int(amount)
+                except Exception:
+                    logger.warning(
+                        f"[save_selected_savings_products] 예금 금액 파싱 실패: {item}"
+                    )
+                    continue
+                if amount <= 0:
+                    continue
+
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO my_products
+                        (user_id, product_name, product_type,
+                         current_value,
+                         end_date, created_at, is_ended)
+                        VALUES
+                        (:uid, :pname, :ptype,
+                         :current,
+                         :end_date, NOW(), 0)
+                        """
+                    ),
+                    {
+                        "uid": user_id,
+                        "pname": pname,
+                        "ptype": "예금",
+                        "current": amount,
+                        "end_date": end_date,
+                    },
+                )
+
+                new_id = result.lastrowid
+                inserted_products.append(
+                    {
+                        "product_id": new_id,
+                        "product_name": pname,
+                        "product_type": "예금",
+                        "amount": amount,
+                        "display_id": f"예금_{new_id:04d}",
+                    }
+                )
+
+            # (B) 적금
+            for item in selected_savings:
+                pname = item.product_name
+                amount = item.amount
+                end_date = item.end_date
+
+                if not pname or amount is None:
+                    logger.warning(
+                        f"[save_selected_savings_products] 잘못된 적금 항목: {item}"
+                    )
+                    continue
+
+                try:
+                    amount = int(amount)
+                except Exception:
+                    logger.warning(
+                        f"[save_selected_savings_products] 적금 금액 파싱 실패: {item}"
+                    )
+                    continue
+                if amount <= 0:
+                    continue
+
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO my_products
+                        (user_id, product_name, product_type,
+                         current_value,
+                         end_date, created_at, is_ended)
+                        VALUES
+                        (:uid, :pname, :ptype,
+                         :current,
+                         :end_date, NOW(), 0)
+                        """
+                    ),
+                    {
+                        "uid": user_id,
+                        "pname": pname,
+                        "ptype": "적금",
+                        "current": amount,
+                        "end_date": end_date,
+                    },
+                )
+
+                new_id = result.lastrowid
+                inserted_products.append(
+                    {
+                        "product_id": new_id,
+                        "product_name": pname,
+                        "product_type": "적금",
+                        "amount": amount,
+                        "display_id": f"적금_{new_id:04d}",
+                    }
+                )
+
+        logger.info(
+            f"✅ save_selected_savings_products 완료 — user_id={user_id}, "
+            f"inserted_count={len(inserted_products)}"
+        )
+
+        return SaveSelectedSavingsProductsResponse(
+            success=True,
+            user_id=user_id,
+            inserted_count=len(inserted_products),
+            products=inserted_products,
+            error=None,
+        )
+
+    except Exception as e:
+        logger.error(f"save_selected_savings_products Error: {e}", exc_info=True)
+        return SaveSelectedSavingsProductsResponse(
+            success=False,
+            user_id=user_id,
+            inserted_count=0,
+            products=[],
+            error=str(e),
+        )
+
+
+# ============================================================
+# 14. [Fund] 선택 펀드 my_products 일괄 저장
+# ============================================================
+@router.post(
+    "/save_selected_funds_products",
+    summary="선택 펀드 my_products 일괄 저장",
+    operation_id="save_selected_funds_products",
+    response_model=SaveSelectedFundsProductsResponse,
+)
+async def save_selected_funds_products(
+    payload: SaveSelectedFundsProductsRequest = Body(...),
+) -> SaveSelectedFundsProductsResponse:
+    """
+    선택한 펀드들을 my_products에 여러 건 INSERT.
+
+    my_products 스키마에 맞춰 principal/payment 컬럼 제거,
+    current_value, preferential_interest_rate, created_at 사용.
+    """
+    user_id = payload.user_id
+    selected_funds = payload.selected_funds or []
+
+    if not user_id:
+        return SaveSelectedFundsProductsResponse(
+            success=False,
+            user_id=0,
+            saved_products=[],
+            error="user_id는 필수입니다.",
+        )
+
+    saved_list: List[Dict[str, Any]] = []
+
+    try:
+        with engine.begin() as conn:
+            for item in selected_funds:
+                fund_name = item.fund_name
+                amount = item.amount
+                fund_desc = item.fund_description or ""
+                expected_yield = item.expected_yield
+                end_date = item.end_date  # Optional[str]
+
+                if not fund_name or amount is None:
+                    logger.warning(
+                        f"[save_selected_funds_products] 잘못된 펀드 항목: {item}"
+                    )
+                    continue
+
+                try:
+                    amount = int(amount)
+                except Exception:
+                    logger.warning(
+                        f"[save_selected_funds_products] 펀드 금액 파싱 실패: {item}"
+                    )
+                    continue
+                if amount <= 0:
+                    continue
+
+                result = conn.execute(
+                    text(
+                        """
+                        INSERT INTO my_products
+                        (user_id, product_name, product_type,
+                         current_value,
+                         product_description, preferential_interest_rate,
+                         end_date, created_at, is_ended)
+                        VALUES
+                        (:uid, :pname, '펀드',
+                         :current,
+                         :pdesc, :rate,
+                         :end_date, NOW(), 0)
+                        """
+                    ),
+                    {
+                        "uid": user_id,
+                        "pname": fund_name,
+                        "current": amount,
+                        "pdesc": fund_desc,
+                        "rate": expected_yield,
+                        "end_date": end_date,
+                    },
+                )
+
+                new_id = result.lastrowid
+                saved_list.append(
+                    {
+                        "product_id": new_id,
+                        "product_name": fund_name,
+                        "amount": amount,
+                        "product_type": "펀드",
+                        "end_date": end_date,
+                    }
+                )
+
+        return SaveSelectedFundsProductsResponse(
+            success=True,
+            user_id=user_id,
+            saved_products=saved_list,
+            error=None,
+        )
+
+    except Exception as e:
+        logger.error(f"save_selected_funds_products Error: {e}", exc_info=True)
+        return SaveSelectedFundsProductsResponse(
+            success=False,
+            user_id=user_id,
+            saved_products=[],
+            error=str(e),
+        )
