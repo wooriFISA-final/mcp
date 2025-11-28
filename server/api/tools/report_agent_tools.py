@@ -1,5 +1,4 @@
 import os
-import requests
 import logging
 import pandas as pd
 import json
@@ -9,11 +8,11 @@ import glob
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Body
 from datetime import datetime, date
+from dateutil.relativedelta import relativedelta 
 from dotenv import load_dotenv, find_dotenv, dotenv_values
 from pathlib import Path
 from langchain_huggingface import HuggingFaceEndpointEmbeddings 
 from langchain_community.vectorstores import FAISS
-# 🚨 [추가] 벡터 DB 구축에 필요한 라이브러리 임포트
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -25,10 +24,10 @@ def _cleanup_rag_env():
     """Hugging Face Endpoint 충돌을 유발할 수 있는 환경 변수를 초기화합니다."""
     if 'HUGGINGFACE_API_URL' in os.environ:
         del os.environ['HUGGINGFACE_API_URL']
-        logger.warning("RAG: 환경 변수 HUGGINGFACE_API_URL 강제 제거됨.")
+        logging.warning("RAG: 환경 변수 HUGGINGFACE_API_URL 강제 제거됨.")
     if 'HF_ENDPOINT' in os.environ:
         del os.environ['HF_ENDPOINT']
-        logger.warning("RAG: 환경 변수 HF_ENDPOINT 강제 제거됨.")
+        logging.warning("RAG: 환경 변수 HF_ENDPOINT 강제 제거됨.")
 
 # 🎯 [ENV 로드]
 load_dotenv(find_dotenv(usecwd=True, raise_error_if_not_found=False) or find_dotenv(usecwd=True) or find_dotenv("..")) 
@@ -52,146 +51,185 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # 🎯 [ENV 변수] 설정 (ENV_VALUES 딕셔너리에서 직접 로드) - 충돌 방지 목적
 # ------------------------------------------------------------------
-# os.getenv 대신 ENV_VALUES 딕셔너리에서 직접 값을 가져와 셸 충돌을 방지합니다.
-OLLAMA_HOST = ENV_VALUES.get("OLLAMA_HOST", 'http://localhost:11434') 
-QWEN_MODEL = ENV_VALUES.get("REPORT_LLM", 'qwen3:8b')
-
-# 🛑 [핵심 설정]: HF_EMBEDDING_MODEL을 Qwen 모델로 설정합니다.
+# RAG 및 정책 검색에 필요한 환경 변수만 로드합니다.
 HF_EMBEDDING_MODEL = ENV_VALUES.get("HF_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
 VECTOR_DB_PATH = ENV_VALUES.get("VECTOR_DB_PATH", '../data/faiss_index')
 HUGGINGFACEHUB_API_TOKEN = ENV_VALUES.get("HUGGINGFACEHUB_API_TOKEN")
 
-# 🚨 [추가] 정책 문서 디렉토리 경로 (원본 코드에서 가져옴)
+# 🚨 [추가] 정책 문서 디렉토리 경로
 POLICY_DIR = "../data/policy_documents"
+
 
 router = APIRouter(
     prefix="/report_processing",
     tags=["Report Processing Tools"] 
 )
 
+# ------------------------------------------------------------------
+# 🎯 [새로운 상수 정의] 정책 파일과 적용 월의 규칙 매핑 (YYYYMMDD_policy.pdf)
+# ------------------------------------------------------------------
+# 정책 배포일(YYYYMMDD) 목록. 이 날짜의 정책은 다음 달 1일 보고서에 반영되어야 합니다.
+POLICY_FILE_DATES = [
+    "20250305",  # 2025년 4월 보고서에 반영
+    "20241224",  # 2025년 1월 보고서에 반영
+    "20240724",  # 2024년 8월 보고서에 반영
+    "20240626",  # 2024년 7월 보고서에 반영
+    "20240430",  # 2024년 5월 보고서에 반영
+    "20230830",  # 2023년 9월 보고서에 반영
+    "20230621",  # 2023년 7월 보고서에 반영
+    "20230302",  # 2023년 4월 보고서에 반영
+]
 
-
-# ==============================================================================
-# 🎯 [신규 TOOL 0] 벡터 DB 재구축 및 업데이트 (가장 상위의 독립 TOOL로 배치)
-# ==============================================================================
-@router.post(
-    "/rebuild_vector_db",
-    summary="정책 문서를 기반으로 FAISS 벡터 DB를 재구축",
-    operation_id="rebuild_vector_db_tool", # ⭐ Agent 호출 ID
-    description="data/policy_documents 폴더의 모든 PDF를 읽어 벡터 DB를 완전히 새로 구축합니다.",
-    response_model=dict,
-)
-async def api_rebuild_vector_db() -> dict:
-    """PDF 파일을 로드, 분할, 임베딩하여 FAISS 벡터 DB를 구축합니다."""
-    
-    logger.info(f"--- RAG 벡터 데이터베이스 구축 시작 (Model: {HF_EMBEDDING_MODEL}) ---")
-    
-    # 1. PDF 파일 경로 확인 및 로드
-    if not os.path.exists(POLICY_DIR):
-        error_msg = f"❌ '{POLICY_DIR}' 폴더가 존재하지 않습니다. data/policy_documents 폴더를 확인해주세요."
-        logger.error(error_msg)
-        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-    file_paths = glob.glob(os.path.join(POLICY_DIR, '*.pdf'))
-    if not file_paths:
-        info_msg = f"✅ policy_documents 폴더에 PDF 파일이 없습니다. 문서를 추가해 주세요."
-        logger.info(info_msg)
-        return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
-
-    documents = []
-    for file_path in file_paths:
-        loader = PyPDFLoader(file_path)
-        documents.extend(loader.load())
-
-    # 2. 텍스트 분할 (Split) - [정책 구조 기반 최적화] (원본 로직 그대로 사용)
-    custom_separators = [
-        r"\n제[0-9]{1,3}장\s",
-        r"\n제[0-9]{1,3}조\s",
-        r"\n[가-힣\d]\.\s?",
-        r"\n\([가-힣\d]{1,2}\)\s?",
-        r"\n",                           
-        " ",
-        ""
-    ]
-    
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,  
-        chunk_overlap=50, 
-        separators=custom_separators,
-        keep_separator=True
-    )
-    texts = text_splitter.split_documents(documents)
-    logger.info(f"➡️ 총 {len(documents)}개 문서에서 {len(texts)}개의 텍스트 청크 생성 완료.")
-    
-    # 3. 임베딩 모델 로드 (HuggingFace Endpoint API 사용)
-    if not HUGGINGFACEHUB_API_TOKEN:
-        error_msg = "❌ HUGGINGFACEHUB_API_TOKEN 환경 변수가 설정되지 않았습니다."
-        logger.error(error_msg)
-        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-    
+# ------------------------------------------------------------------
+# 🎯 [수정된 함수]: 보고서 월에 해당하는 정책 파일을 찾습니다.
+# ------------------------------------------------------------------
+def _find_policy_file_for_report(report_date_str: str) -> Optional[str]:
+    """
+    보고서 날짜(YYYY-MM-DD)를 기준으로, 해당 월에 반영해야 할 정책 파일을 찾습니다.
+    (정책 발표일 다음 달 1일이 보고서 작성일인 경우 해당 정책 파일을 선택)
+    """
     try:
-        embeddings = HuggingFaceEndpointEmbeddings(
-            model=HF_EMBEDDING_MODEL, 
-            huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
-        )
-    except Exception as e:
-        error_msg = f"🚨 임베딩 모델 로드 실패: {e}"
-        logger.error(error_msg)
-        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+        # 보고서가 발행되는 월의 1일 (예: 2024-12-01)
+        report_month_start = datetime.strptime(report_date_str, "%Y-%m-%d").replace(day=1)
 
-    # 4. 벡터 DB 생성 및 저장 (원본 로직 그대로 사용)
-    logger.info(f"💾 FAISS 벡터 DB 생성 중... ({len(texts)}개 청크)")
-    batch_size = 32
-    sleep_time = 3
-    
-    if not texts:
-        return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": "경고: 분할된 텍스트 청크가 없어 DB 구축을 건너뜁니다."}
+        # 정책 파일 날짜 목록을 역순으로 순회 (최신 정책부터 확인)
+        for policy_date_str in sorted(POLICY_FILE_DATES, reverse=True):
+            policy_date = datetime.strptime(policy_date_str, "%Y%m%d").date()
+            
+            # 정책 발표일의 다음 달 1일 (정책 변동 사항이 반영될 목표 보고서 월)
+            policy_effective_month_start = (datetime(policy_date.year, policy_date.month, 1) + relativedelta(months=1))
+            
+            # 만약 정책의 유효 시작 월이 현재 처리 중인 보고서 월과 같다면, 이 정책을 사용합니다.
+            if policy_effective_month_start == report_month_start:
+                filename = f"{policy_date_str}_policy.pdf"
+                full_path = os.path.join(POLICY_DIR, filename)
+                
+                if os.path.exists(full_path):
+                    logger.info(f"RAG: {report_date_str[:7]} 보고서에 {filename} 정책 파일 지정됨.")
+                    return full_path
+                else:
+                    logger.warning(f"RAG: 지정된 정책 파일({filename})이 디렉토리에 없습니다.")
+                    return None
         
-    first_batch = texts[:batch_size]
-    remaining_texts = texts[batch_size:]
-
-    try:
-        # DB 초기 생성
-        db = FAISS.from_documents(first_batch, embeddings)
-    except Exception as e:
-        error_msg = f"🚨 DB 초기 생성 실패: {e}"
-        logger.error(error_msg)
-        return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-    # 나머지 청크를 배치 처리
-    total_processed = len(first_batch)
-    
-    for i in range(0, len(remaining_texts), batch_size):
-        batch = remaining_texts[i:i + batch_size]
-        logger.info(f"   -- API 요청 지연 ({sleep_time}초 대기) --")
-        time.sleep(sleep_time)
+        logger.info(f"RAG: {report_date_str[:7]} 보고서에 반영할 정책 파일을 찾지 못했습니다. (해당 월은 정책 변동 없음)")
+        return None
         
-        try:
-            # DB에 추가
-            db.add_documents(batch)
-            total_processed += len(batch)
-            logger.info(f"   -> {total_processed} / {len(texts)}개 청크 추가 완료.")
-        except Exception as e:
-            error_msg = f"🚨 임베딩 오류 발생: {e}. DB 구축을 중단합니다."
-            logger.error(error_msg)
-            return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-    # 벡터 DB 경로 생성 및 저장
-    Path(VECTOR_DB_PATH).mkdir(parents=True, exist_ok=True)
-    db.save_local(VECTOR_DB_PATH) 
-
-    info_msg = f"--- ✅ 벡터 DB 구축 완료 --- (저장 경로: {VECTOR_DB_PATH})"
-    logger.info(info_msg)
-    return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
-
-
+    except Exception as e:
+        logger.error(f"정책 파일 결정 중 오류 발생: {e}")
+        return None
 
 
 # ------------------------------------------------------------------
-# 🎯 정책 PDF 구조에 맞춰 RAG 검색을 자동화할 키워드 목록
+# 🎯 [신규 TOOL 0] 벡터 DB 재구축 및 업데이트
 # ------------------------------------------------------------------
+# @router.post(
+#     "/rebuild_vector_db",
+#     summary="정책 문서를 기반으로 FAISS 벡터 DB를 재구축",
+#     operation_id="rebuild_vector_db_tool",
+#     description="data/policy_documents 폴더의 모든 PDF를 읽어 벡터 DB를 완전히 새로 구축합니다.",
+#     response_model=dict,
+# )
+# async def api_rebuild_vector_db() -> dict:
+#     """PDF 파일을 로드, 분할, 임베딩하여 FAISS 벡터 DB를 구축합니다."""
+    
+#     logger.info(f"--- RAG 벡터 데이터베이스 구축 시작 (Model: {HF_EMBEDDING_MODEL}) ---")
+    
+#     if not os.path.exists(POLICY_DIR):
+#         error_msg = f"❌ '{POLICY_DIR}' 폴더가 존재하지 않습니다. data/policy_documents 폴더를 확인해주세요."
+#         logger.error(error_msg)
+#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+#     file_paths = glob.glob(os.path.join(POLICY_DIR, '*.pdf'))
+#     if not file_paths:
+#         info_msg = f"✅ policy_documents 폴더에 PDF 파일이 없습니다. 문서를 추가해 주세요."
+#         logger.info(info_msg)
+#         return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
+
+#     documents = []
+#     for file_path in file_paths:
+#         loader = PyPDFLoader(file_path)
+#         documents.extend(loader.load())
+
+#     custom_separators = [
+#         r"\n제[0-9]{1,3}장\s",
+#         r"\n제[0-9]{1,3}조\s",
+#         r"\n[가-힣\d]\.\s?",
+#         r"\n\([가-힣\d]{1,2}\)\s?",
+#         r"\n",                           
+#         " ",
+#         ""
+#     ]
+    
+#     text_splitter = RecursiveCharacterTextSplitter(
+#         chunk_size=1000,  
+#         chunk_overlap=50, 
+#         separators=custom_separators,
+#         keep_separator=True
+#     )
+#     texts = text_splitter.split_documents(documents)
+#     logger.info(f"➡️ 총 {len(documents)}개 문서에서 {len(texts)}개의 텍스트 청크 생성 완료.")
+    
+#     if not HUGGINGFACEHUB_API_TOKEN:
+#         error_msg = "❌ HUGGINGFACEHUB_API_TOKEN 환경 변수가 설정되지 않았습니다."
+#         logger.error(error_msg)
+#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+    
+#     try:
+#         embeddings = HuggingFaceEndpointEmbeddings(
+#             model=HF_EMBEDDING_MODEL, 
+#             huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
+#         )
+#     except Exception as e:
+#         error_msg = f"🚨 임베딩 모델 로드 실패: {e}"
+#         logger.error(error_msg)
+#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+#     logger.info(f"💾 FAISS 벡터 DB 생성 중... ({len(texts)}개 청크)")
+#     batch_size = 32
+#     sleep_time = 3
+    
+#     if not texts:
+#         return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": "경고: 분할된 텍스트 청크가 없어 DB 구축을 건너뜁니다."}
+        
+#     first_batch = texts[:batch_size]
+#     remaining_texts = texts[batch_size:]
+
+#     try:
+#         db = FAISS.from_documents(first_batch, embeddings)
+#     except Exception as e:
+#         error_msg = f"🚨 DB 초기 생성 실패: {e}"
+#         logger.error(error_msg)
+#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+#     total_processed = len(first_batch)
+    
+#     for i in range(0, len(remaining_texts), batch_size):
+#         batch = remaining_texts[i:i + batch_size]
+#         logger.info(f"   -- API 요청 지연 ({sleep_time}초 대기) --")
+#         time.sleep(sleep_time)
+        
+#         try:
+#             db.add_documents(batch)
+#             total_processed += len(batch)
+#             logger.info(f"   -> {total_processed} / {len(texts)}개 청크 추가 완료.")
+#         except Exception as e:
+#             error_msg = f"🚨 임베딩 오류 발생: {e}. DB 구축을 중단합니다."
+#             logger.error(error_msg)
+#             return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
+
+#     Path(VECTOR_DB_PATH).mkdir(parents=True, exist_ok=True)
+#     db.save_local(VECTOR_DB_PATH) 
+
+#     info_msg = f"--- ✅ 벡터 DB 구축 완료 --- (저장 경로: {VECTOR_DB_PATH})"
+#     logger.info(info_msg)
+#     return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
+
+
+# ------------------------------------------------------------------
+# 🎯 [정책 섹션 정의] RAG 검색 시 사용할 섹션 목록
+# ------------------------------------------------------------------
+# 1장은 문서 전체 개정 이력만 있으므로 제외하고, 2장부터 검색
 POLICY_SECTIONS_TO_CHECK = [
-    "1장 가. 용어의 정의 변경 및 신설 항목",
     "2장 나. 주택담보대출 담보인정비율(LTV) 변동 및 특례 적용",
     "3장 다. 주택담보대출 총부채상환비율(DTI) 적용 및 배제 기준",
     "4장 라. 고액 가계대출 DSR 적용 기준 및 예외 사항",
@@ -208,13 +246,10 @@ def _rag_similarity_search(query: str, k: int = 5, required_sources: Optional[Li
     if not HUGGINGFACEHUB_API_TOKEN:
         return "🚨 RAG 검색 실패: HUGGINGFACEHUB_API_TOKEN이 설정되지 않았습니다."
         
-    # 🎯 [최종 확인]: HF_EMBEDDING_MODEL 변수의 현재 값을 사용
     current_model = HF_EMBEDDING_MODEL 
     logger.info(f"RAG: 임베딩 모델 {current_model} 사용.")
 
-
     try:
-        # 🎯 HuggingFaceEndpointEmbeddings 사용
         embeddings = HuggingFaceEndpointEmbeddings(
             model=current_model,
             huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
@@ -222,29 +257,37 @@ def _rag_similarity_search(query: str, k: int = 5, required_sources: Optional[Li
         
         db = FAISS.load_local(VECTOR_DB_PATH, embeddings, allow_dangerous_deserialization=True)
         
-        # 필터링을 위해 충분히 많은 청크를 가져옵니다.
-        # RAG 검색 깊이는 정책 누락 방지를 위해 7로 유지합니다.
         found_chunks = db.similarity_search(query, k=k * 4) 
+        
+        logger.info(f"RAG: 검색어 '{query}'로 {len(found_chunks)}개 청크 발견 (required_sources: {required_sources})")
         
         context = []
         filtered_count = 0
         
-        for chunk in found_chunks:
+        for idx, chunk in enumerate(found_chunks):
             source = chunk.metadata.get("source", "출처 미상")
             
-            # 🎯 [핵심 로직] required_sources 리스트에 해당 source가 포함되는지 확인합니다.
+            # 디버깅: 처음 5개 청크의 source 출력
+            if idx < 5:
+                logger.info(f"RAG: 청크 {idx} - source: '{source}'")
+            
             is_valid_source = not required_sources or any(req_src in source for req_src in required_sources)
             
             if not is_valid_source:
+                if idx < 5:
+                    logger.info(f"RAG: 청크 {idx} - 필터링됨 (source 불일치)")
                 continue
 
-            # 필터링된 결과만 K개까지 저장
             if filtered_count < k:
                 context.append(f"[출처: {source}]\n{chunk.page_content}")
                 filtered_count += 1
+                if idx < 5:
+                    logger.info(f"RAG: 청크 {idx} - 포함됨!")
             else:
                 break
 
+        logger.info(f"RAG: 최종 {filtered_count}개 청크 반환 (목표: {k}개)")
+        
         if not context:
             source_info = f"문서 목록: {required_sources}" if required_sources else "모든 문서"
             return f"🚨 RAG 검색 실패: 검색어 '{query}'에 대해 {source_info}에서 유효한 청크를 찾지 못했습니다."
@@ -257,163 +300,90 @@ def _rag_similarity_search(query: str, k: int = 5, required_sources: Optional[Li
 
 
 # ------------------------------------------------------------------
-# 🎯 [신규 유틸리티 함수]: 정책 문서 디렉토리에서 최신 파일 경로 찾기
+# 🎯 [신규 함수]: 정규표현식으로 마커 포함 구문 100% 탐지 (개정/신설 유연성 강화)
 # ------------------------------------------------------------------
-def _find_latest_policy_file(base_dir: str) -> Optional[str]:
+def _find_policies_by_marker_regex(context: str, target_date: Optional[str] = None) -> List[Dict[str, str]]:
     """
-    지정된 디렉토리에서 'YYYYMMDD_policy.pdf' 패턴을 따르는 파일 중
-    날짜가 가장 최신인 파일의 경로를 반환합니다.
+    RAG 컨텍스트 내에서 <신설 YYYY.M.D.> 또는 <개정 YYYY.M.D.> 마커를 포함한 정책 구문을 정규표현식으로 추출 및 정규화.
+    
+    Args:
+        context: RAG 검색 결과 텍스트
+        target_date: 필터링할 목표 날짜 (YYYY-MM-DD 형식). 지정 시 해당 날짜의 변경사항만 반환
     """
     
-    # 🚨 Path 객체를 사용하여 디렉토리 접근
-    policy_dir = Path(base_dir) 
-    
-    if not policy_dir.is_dir():
-        logger.error(f"정책 문서 디렉토리를 찾을 수 없습니다: {base_dir}")
-        return None
-    
-    # 정규표현식: YYYYMMDD_policy.pdf 패턴에 맞고, 날짜 부분을 그룹으로 캡처
-    date_file_pattern = re.compile(r'(\d{8})_policy\.pdf$', re.IGNORECASE)
-    
-    latest_file_info = None # (날짜, 경로) 튜플 저장
-    
-    # 디렉토리 내 모든 PDF 파일 탐색
-    for file_path in policy_dir.glob('*_policy.pdf'):
-        match = date_file_pattern.search(file_path.name)
-        
-        if match:
-            file_date_str = match.group(1)
-            
-            # 가장 큰(최신) 날짜를 찾습니다.
-            if latest_file_info is None or file_date_str > latest_file_info[0]:
-                # 윈도우/리눅스 환경 모두에서 경로를 올바르게 사용하기 위해 str로 변환
-                latest_file_info = (file_date_str, str(file_path)) 
-
-    if latest_file_info:
-        logger.info(f"RAG: 가장 최신 정책 파일 발견: {latest_file_info[1]}")
-        return latest_file_info[1]
-    else:
-        logger.warning(f"RAG: {base_dir}에서 유효한 정책 파일을 찾지 못했습니다.")
-        return None
-
-# ------------------------------------------------------------------
-# 🎯 [신규 함수]: 정규표현식으로 마커 포함 구문 100% 탐지
-# ------------------------------------------------------------------
-def _find_policies_by_marker_regex(context: str) -> List[Dict[str, str]]:
-    """RAG 컨텍스트 내에서 <신설 YYYY.M.D.> 마커를 포함한 정책 구문을 정규표현식으로 추출 및 정규화."""
-    
-    # 🚨 RAG 컨텍스트에서 출처(Source) 정보와 관련된 모든 문자열을 미리 제거합니다.
     context_clean = re.sub(r'\[출처:.*?\.pdf\]', '', context, flags=re.DOTALL)
     context_clean = re.sub(r'---\n', '', context_clean, flags=re.DOTALL)
     
-    # 🎯 수정된 정규식: 조항 기호로 시작하고 마커로 끝나는 구문을 정확히 탐지합니다.
-    regex = r"([\n\s]*([가-힣\d]+\.|\([가-힣\d]+\))[\s\S]*?)\< *(신설|개정)\s*(\d{4})\.(\d{1,2})\.(\d{1,2})\.\s*>"
+    # 정규표현식: 조항 번호 + 내용 + <신설/개정 날짜> 패턴 찾기
+    # 예: "21.(임차보증금반환목적...) <개정 2024.7.24., 2024.12.24.>"
+    # <별표6><신설...> 같은 문서 전체 개정 이력은 제외
+    regex = r"(\d{1,3}\.[\s\S]{10,1000}?)<\s*(신설|개정)\s*([^>]+)>"
     
     matches = re.findall(regex, context_clean, re.DOTALL) 
     
+    logger.info(f"RAG: 정규표현식 매칭 결과 {len(matches)}개 발견")
+    
     extracted_changes = []
     
-    for full_text, start_marker, change_type, year, month, day in matches:
-        # 정책 내용: 마커 직전의 텍스트와 마커를 포함
-        policy_text_with_marker = full_text.strip()
+    for policy_text, change_type, dates_str in matches:
+        # <별표X> 패턴이 포함된 경우 제외
+        if re.search(r'<별표\d+>', policy_text):
+            logger.info(f"RAG: <별표> 패턴 발견으로 제외")
+            continue
         
-        # 🚨 띄어쓰기가 없는 한글/영어/숫자 사이에 공백을 삽입하여 텍스트를 정규화합니다.
-        normalized_text = re.sub(r'([가-힣a-zA-Z\d])([가-힣a-zA-Z\d])', r'\1 \2', policy_text_with_marker).strip()
-        # 다중 공백을 단일 공백으로 치환
-        normalized_text = re.sub(r'\s{2,}', ' ', normalized_text)
+        # 날짜 문자열에서 모든 날짜 추출
+        date_pattern = r'(\d{4})\.(\d{1,2})\.(\d{1,2})'
+        all_dates = re.findall(date_pattern, dates_str)
+        
+        if not all_dates:
+            logger.warning(f"RAG: 날짜 파싱 실패 - dates_str: '{dates_str}'")
+            continue
+        
+        # 가장 최신 날짜 찾기 (마지막 날짜가 보통 최신)
+        latest_date_tuple = all_dates[-1]
+        year, month, day = latest_date_tuple
         
         try:
             effective_date = datetime(int(year), int(month), int(day)).strftime("%Y-%m-%d")
         except ValueError:
-            effective_date = "N/A"
+            logger.warning(f"RAG: 날짜 변환 실패 - year: {year}, month: {month}, day: {day}")
+            continue
+        
+        logger.info(f"RAG: 발견된 변경사항 - 날짜: {effective_date}, 타입: {change_type}, 조항: {policy_text[:50]}...")
+        
+        # target_date가 지정된 경우, 해당 날짜와 일치하는 것만 포함
+        if target_date:
+            if effective_date != target_date:
+                logger.info(f"RAG: 날짜 불일치로 제외 - effective_date: {effective_date}, target_date: {target_date}")
+                continue
+            else:
+                logger.info(f"RAG: 날짜 일치! 포함 - {effective_date}")
+        
+        # 텍스트 정규화
+        normalized_text = policy_text.strip()
+        normalized_text = re.sub(r'\s{2,}', ' ', normalized_text)
+        
+        # 마커 추가
+        full_text = f"{normalized_text} <{change_type} {dates_str}>"
+        
+        extracted_changes.append({
+            "effective_date": effective_date,
+            "policy_text": full_text
+        })
 
-        # 마커의 날짜가 2025-03-05 이후인지 확인 (파일 날짜 기준)
-        if effective_date >= "2025-03-05": 
-            extracted_changes.append({
-                "effective_date": effective_date,
-                "policy_text": normalized_text
-            })
-
+    logger.info(f"RAG: 최종 추출된 변경사항 {len(extracted_changes)}개 (target_date: {target_date})")
     return extracted_changes
 
 
-# ------------------------------------------------------------------
-# 🎯 [수정된 내부 로직 2]: LLM을 통해 정책 분석 보고서 생성 (구조화된 텍스트 인풋)
-# ------------------------------------------------------------------
-def _generate_final_report_from_structured_data(report_month_str: str, structured_changes: List[Dict[str, str]]) -> Dict[str, Any]:
-    """Python이 찾은 정책 변동 리스트를 LLM에게 넘겨 최종 분석 보고서 텍스트를 생성합니다."""
-    
-    report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date()
-    report_month_str_kr = report_month.strftime('%Y년 %m월')
-    
-    # LLM 인풋 텍스트 포맷팅
-    analysis_input = "\n---\n".join([f"[{c['effective_date']}] {c['policy_text']}" for c in structured_changes])
-    
-    # 가장 빠른 시행일자를 찾아 분석 보고서 제목에 사용
-    earliest_date = structured_changes[0]['effective_date'] if structured_changes else "2025-03-05"
 
-    # 🎯 [프롬프트 변경]: 단일 간결한 분석 요약만 요청하도록 변경
-    prompt = f"""
-    [System] 당신은 전문 금융 분석가입니다. 아래는 Python을 통해 추출된, 2025년 3월 5일 이후 시행될 정책 변동 사항의 핵심 조항 목록입니다.
-    
-    이 목록을 기반으로 고객에게 전달할 **간결한 단일 단락 분석 보고서**를 한국어로 작성하십시오.
-    
-    
-    **보고서 형식:**
-    1. 반드시 '📌 [시행일: {earliest_date}]'로 시작하십시오.
-    2. 보고서는 헤더, 푸터, 제목 없이 **하나의 간결한 단락**으로 구성하십시오.
-    3. 변동 사항의 핵심 내용과 고객에게 미치는 영향을 포함하여 5줄 이내로 요약하십시오.
-    4. **정책 변동 사항의 목록** 외에 LTV/DSR 같은 **일반적인 배경 정보**는 포함하지 마십시오.
-    5. 출력 예시문은 다음과 같습니다.
-    "📌 [시행일: 2025-03-05] 정책 핵심 내용 요약.
-    고객 영향: 2025년 3월 5일부터 특정 대출 상품(규제지역 내 고가 주택 담보 대출, 신용대출, 
-    가계대출 등)에 대해 총부채원리금상환비율 기준을 강화해 적용하며, 
-    고객의 대출 한도 및 신규 대출 가능성에 제한이 있을 수 있습니다."
-    
-    [추출된 정책 변동 사항]
-    {analysis_input}
-    
-    [간결한 최종 분석 보고서]
-    """
-    
-    payload = {"model": QWEN_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.5}}
-    
-    try:
-        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        final_analysis_report = response.json()['response'].strip()
-        
-        # 🚨 [Guardrail 필터]: LLM이 추가한 헤더, 섹션, 구분자 등을 강제로 제거하고 단일 문장으로 만듭니다.
-        
-        # 1. 모든 Markdown Headers 및 구분자 제거
-        cleaned_report = re.sub(r'(#+|--+|=+)\s*.*?\n', ' ', final_analysis_report, flags=re.DOTALL)
-        # 2. 다중 공백 단일화 및 앞뒤 공백 제거
-        cleaned_report = re.sub(r'\s{2,}', ' ', cleaned_report).strip()
-        
-        # 3. '📌 [시행일: YYYY-MM-DD]' 접두사 강제 적용 및 재정렬
-        earliest_date = structured_changes[0]['effective_date'] if structured_changes else "2025-03-05"
-        
-        # '📌 [시행일: 2025-03-05]' 문자열 자체를 제외한 나머지 내용만 추출
-        content_only = re.sub(r'^📌\s*\[시행일:\s*[\d-]*\s*\]\s*', '', cleaned_report).strip()
-        
-        final_analysis_report = f"📌 [시행일: {earliest_date}] {content_only}"
-        
-        # LLM이 너무 길게 출력했다면 자르거나, 단일 단락으로 강제 변환
-        final_analysis_report = ' '.join(final_analysis_report.split()) # 모든 줄바꿈을 공백으로 바꾸고 단일 단락으로 강제 변환
-        
-        return {
-            "analysis_report": final_analysis_report, 
-            "error": None,
-        }
+# ------------------------------------------------------------------
+# 🎯 [REMOVED]: _generate_final_report_from_structured_data
+# This function has been removed. The Agent will now handle policy report generation.
+# ------------------------------------------------------------------
 
-    except Exception as e:
-        logger.error(f"최종 정책 분석 LLM 오류: {e}", exc_info=True)
-        return {
-            "analysis_report": "최종 정책 분석 보고서 생성 중 시스템 오류 발생", 
-            "error": str(e)
-        }
 
 # ==============================================================================
-# 독립 Tool 1: 소비 데이터 분석 및 군집 생성 (최종 수정)
+# 독립 Tool 1: 소비 데이터 분석 및 군집 생성
 # ==============================================================================
 @router.post(
     "/analyze_user_spending",
@@ -424,105 +394,70 @@ def _generate_final_report_from_structured_data(report_month_str: str, structure
 )
 async def analyze_user_spending(
     consume_records: List[Dict[str, Any]] = Body(..., embed=True),
-    member_data: Dict[str, Any] = Body(..., embed=False),
-    ollama_model: Optional[str] = Body(QWEN_MODEL, embed=False)
+    member_data: Dict[str, Any] = Body(..., embed=False)
 ) -> dict:
-    """소비 데이터를 기반으로 군집을 분석하고, LLM을 통해 조언을 생성합니다."""
+    """소비 데이터를 기반으로 분석 데이터를 생성합니다. (LLM 호출 제거 - Agent가 처리)"""
 
-    # 🚨 데이터 부족 시 처리 (이전 수정분 유지)
     if not consume_records or len(consume_records) < 2:
         error_msg = "비교 분석을 위한 최소 2개월 데이터 부족" if consume_records else "분석할 소비 데이터가 존재하지 않아 건너뜁니다."
         return {
             "tool_name": "analyze_user_spending_tool", 
-            "success": True, 
-            "consume_report": error_msg,
-            "cluster_nickname": "분석 불가", 
+            "success": False, 
+            "error": error_msg,
             "consume_analysis_summary": {},
             "spend_chart_json": json.dumps({})
         }
     
     try:
+        # 데이터프레임으로 변환 및 정렬
         df_consume = pd.DataFrame(consume_records)
-        df_consume['spend_month'] = pd.to_datetime(df_consume['spend_month'])
-        df_consume = df_consume.sort_values(by='spend_month', ascending=False)
+        df_consume['year_and_month'] = pd.to_datetime(df_consume['year_and_month'])
+        df_consume = df_consume.sort_values(by='year_and_month', ascending=False)
         
-        feb_data = df_consume.iloc[0] # 최신 월 데이터
-        jan_data = df_consume.iloc[1]
+        latest_data = df_consume.iloc[0] # 최신 월 데이터
+        previous_data = df_consume.iloc[1]
 
-        total_spend_feb = feb_data.get('total_spend', 0) or 0
-        total_spend_jan = jan_data.get('total_spend', 0) or 0
-        diff = total_spend_feb - total_spend_jan
-        change_rate = (diff / total_spend_jan) * 100 if total_spend_jan else 0
+        total_spend_latest = latest_data.get('total_spend', 0) or 0
+        total_spend_prev = previous_data.get('total_spend', 0) or 0
+        diff = total_spend_latest - total_spend_prev
+        change_rate = (diff / total_spend_prev) * 100 if total_spend_prev else 0
         change_text = f"{diff:+,}원 ({change_rate:.2f}%) 변동"
 
-        cat1_cols = [col for col in feb_data.index if col.startswith('CAT1_')]
+        # CAT1 컬럼 목록 생성 (JSON 키 기반)
+        cat1_cols = [col for col in latest_data.index if col.startswith('CAT1_')]
         
-        # 🚨 [수정 1] Top 5 카테고리 추출
-        feb_cats = df_consume.iloc[0][cat1_cols].sort_values(ascending=False).head(5) 
+        # Top 5 카테고리 추출
+        latest_cats = df_consume.iloc[0][cat1_cols].sort_values(ascending=False).head(5) 
         
-        # 🚨 [수정 2] spend_chart_json을 위한 전체 CAT1 카테고리별 금액 계산
+        # spend_chart_json을 위한 전체 CAT1 카테고리별 금액 계산
         chart_data_list = []
         for col in cat1_cols:
-            amount = feb_data.get(col, 0) or 0
+            amount = latest_data.get(col, 0) or 0
             if amount > 0:
+                label = col.replace('CAT1_', '').replace('_', ' ').replace(' ', '/') 
                 chart_data_list.append({
-                    "category": col.replace('CAT1_', ''), 
+                    "category": label,
                     "amount": int(amount)
                 })
         spend_chart_json = json.dumps(chart_data_list, ensure_ascii=False)
         
-        # 🚨 [수정 3] consume_analysis_summary에 Top 5 반영 (키 이름 수정됨)
+        # consume_analysis_summary 구성 (Agent가 사용할 데이터)
         consume_analysis_summary = {
-            'latest_total_spend': f"{total_spend_feb:,}",
-            'total_change_diff': f"{change_text}",
-            'top_5_categories': [col.replace('CAT1_', '') for col in feb_cats.index], 
+            'latest_total_spend': int(total_spend_latest),
+            'previous_total_spend': int(total_spend_prev),
+            'spend_diff': int(diff),
+            'change_rate': round(change_rate, 2),
+            'total_change_diff': change_text,
+            'top_5_categories': [col.replace('CAT1_', '') for col in latest_cats.index],
+            'top_5_amounts': [int(latest_cats[col]) for col in latest_cats.index],
             'member_info': member_data
         }
-
-        # 🚨 [핵심 수정 4]: LLM이 별명과 보고서를 모두 생성하도록 프롬프트 수정
-        system_instruction = "당신은 고객의 소비 분석가이자 별명 생성 전문가입니다. 아래 분석 결과를 바탕으로 고객에게 전달할 4줄의 **간결하고 정중한** 소비 분석 보고서와 저축/투자 조언을 한국어로 작성하십시오."
-            
-        prompt = f"""
-        [System] {system_instruction}
-        
-        [분석 결과]
-        총 지출: {consume_analysis_summary['latest_total_spend']}원, 변화: {consume_analysis_summary['total_change_diff']}. 
-        주요 5대 소비 영역: {', '.join(consume_analysis_summary['top_5_categories'])}. 
-        고객 정보: {member_data} (연봉, 부채, 신용 점수 포함)
-
-        [출력 형식]
-        1. **첫 줄에는 반드시** 분석한 소비 패턴에 가장 적합한 **군집 별명**만을 `[별명: XXX]` 형태로 작성하십시오. 이 별명은 Top 5 소비와 재정 건전성(부채 등)을 고려하여 직접 생성해야 합니다.
-        2. **두 번째 줄부터** 지출 변화 해석, 주요 카테고리 설명, 재정 조언을 포함한 4줄의 소비 분석 보고서를 작성하십시오.
-        3. 보고서 본문에는 별명을 다시 언급하지 마십시오.
-
-        """
-        
-        payload = {"model": QWEN_MODEL, "prompt": prompt, "stream": False}
-        
-        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        llm_response_text = response.json()['response'].strip()
-        
-        # 🚨 [핵심 수정 5]: LLM 응답에서 별명과 보고서를 분리하여 추출
-        nickname = "분석 불가" # 초기화 (이전 하드코딩 값 제거)
-        consume_report = llm_response_text
-        
-        # 정규식으로 [별명: XXX] 추출
-        nickname_match = re.search(r'\[별명:\s*(.+?)\]', llm_response_text, re.IGNORECASE)
-        
-        if nickname_match:
-            nickname = nickname_match.group(1).strip()
-            # 별명 태그를 제거하고 보고서 본문만 남김 (첫 줄에서만 제거)
-            consume_report = re.sub(r'\[별명:\s*(.+?)\]\s*', '', llm_response_text, count=1).strip()
-            if not consume_report:
-                consume_report = "LLM이 별명만 생성하고 보고서 내용을 생성하지 않았습니다. 다시 시도해 주세요."
         
         return {
             "tool_name": "analyze_user_spending_tool", 
             "success": True, 
-            "consume_report": consume_report,
-            "cluster_nickname": nickname, 
-            "consume_analysis_summary": consume_analysis_summary, # top_5_categories 키가 포함됨
-            "spend_chart_json": spend_chart_json # 전체 카테고리 금액 JSON이 포함됨
+            "consume_analysis_summary": consume_analysis_summary,
+            "spend_chart_json": spend_chart_json
         }
 
     except Exception as e:
@@ -531,7 +466,7 @@ async def analyze_user_spending(
 
     
 # ==============================================================================
-# 독립 Tool 2: 최종 3줄 요약 LLM Tool (복구)
+# 독립 Tool 2: 최종 3줄 요약 LLM Tool
 # ==============================================================================
 @router.post(
     "/generate_final_summary",
@@ -541,35 +476,23 @@ async def analyze_user_spending(
     response_model=dict,
 )
 async def api_generate_final_summary(report_content: str = Body(..., embed=True)) -> dict:
-    """Agent가 보고서 본문을 전송하면, LLM을 통해 3줄 핵심 요약본을 생성합니다."""
-    
-    # 🎯 [수정] 구분자 무시 지침 포함
-    prompt_template = f"""
-    [System] 당신은 전문 분석가입니다. 아래 통합 보고서 내용을 읽고, **가장 핵심적인 3가지 사항**만 뽑아 간결하게 **3줄**로 요약하십시오. 보고서 본문 외의 설명이나 제목, 또는 구분자(---SECTION_END---)와 같은 **불필요한 기호는 모두 무시**하십시오.
-    
-    [통합 보고서 내용]
-    {report_content}
-    
-    [3줄 요약]
+    """
+    [DEPRECATED] This tool now returns the report content as-is. 
+    The Agent will handle summarization internally instead of calling this tool.
     """
     
-    payload = {"model": QWEN_MODEL, "prompt": prompt_template, "stream": False, "options": {"temperature": 0.3}}
-    
-    try:
-        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        final_summary = response.json()['response'].strip()
-        lines = [line.strip() for line in final_summary.split('\n') if line.strip()]
-        threelines_summary = "\n".join(lines[:3]) # 🎯 [수정] 아웃풋 필드명에 맞춤
-        
-        return {"tool_name": "generate_final_summary_llm", "success": True, "threelines_summary": threelines_summary}
-    except requests.exceptions.RequestException as e:
-        error_msg = f"Ollama 통신 오류: {e}"
-        return {"tool_name": "generate_final_summary_llm", "success": False, "error": error_msg, "threelines_summary": "3줄 요약 생성 실패"}
+    return {
+        "tool_name": "generate_final_summary_llm", 
+        "success": True, 
+        "report_content": report_content,
+        "message": "이 도구는 더 이상 LLM을 호출하지 않습니다. Agent가 직접 요약을 생성합니다."
+    }
 
 
-# # ------------------------------------------------------------------
-# 🎯 툴 3-D: 정책 변동 자동 비교 및 보고서 생성 툴 (핵심)
-# ------------------------------------------------------------------
+
+# ==============================================================================
+# 독립 Tool 3: 정책 변동 자동 비교 및 보고서 생성 툴 (🌟 수정 완료)
+# ==============================================================================
 @router.post(
     "/check_and_report_policy_changes",
     summary="매월 자동 정책 변동 비교 및 보고서 생성",
@@ -580,25 +503,25 @@ async def api_generate_final_summary(report_content: str = Body(..., embed=True)
 async def api_check_policy_changes(
     report_month_str: str = Body(..., embed=True) 
 ) -> dict:
-    """매월 정기 보고서 생성을 위해 정책 변동 사항을 자동으로 비교하고 보고서를 생성합니다."""
+    """매월 정기 보고서 생성을 위해 정책 변동 사항을 자동으로 비교합니다. (LLM 호출 제거 - Agent가 처리)"""
     
-    # 🎯 [수정 1] RAG 검색 대상을 동적으로 찾습니다.
-    POLICY_DOCUMENT_DIR = '../data/policy_documents' # 경로 수정 반영
-    LATEST_POLICY_SOURCE = _find_latest_policy_file(POLICY_DOCUMENT_DIR) # _find_latest_policy_file 함수는 외부 정의됨
+    # 🎯 [핵심 수정]: 보고서 월에 해당하는 정책 파일을 찾습니다. (새로운 로직 반영)
+    LATEST_POLICY_SOURCE = _find_policy_file_for_report(report_month_str)
     
     if not LATEST_POLICY_SOURCE:
-        analysis_report = "정책 문서 디렉토리에서 유효한 최신 정책 파일을 찾을 수 없습니다."
+        # 정책 파일이 없으면 변동 없음으로 간주
+        report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date().strftime('%Y년 %m월')
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
-            "success": False, 
-            "analysis_report": analysis_report, 
+            "success": True, 
             "policy_changes": [],
-            "error": "최신 정책 파일 검색 실패",
+            "report_month": report_month,
+            "message": f"{report_month} 보고서 기준, 해당 월에 반영할 정책 변동 사항이 없습니다."
         }
         
     REQUIRED_SOURCES = [LATEST_POLICY_SOURCE] 
     
-    # 1. 📅 날짜 체크 및 초기 설정 (보고서 유효성 체크 및 단일 보고 주기 체크)
+    # 1. 📅 날짜 체크 및 초기 설정
     try:
         report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date()
         
@@ -607,64 +530,20 @@ async def api_check_policy_changes(
         latest_policy_date_str = file_name.split('_')[0] # 'YYYYMMDD' 추출
         latest_policy_date = datetime.strptime(latest_policy_date_str, "%Y%m%d").date()
         
-        # 🎯 [수정 2] 최소 필터 날짜를 최신 정책 파일 날짜와 동일하게 설정
-        MINIMUM_FILTER_DATE_DT = latest_policy_date 
-        
-        # ----------------------------------------------------------------------
-        # 🎯 [핵심 추가] 단일 보고 주기 확인 로직: 정책 변동은 다음 달 보고서에만 반영
-        # ----------------------------------------------------------------------
-        
-        # 1. 최신 정책 문서 날짜 이후의 '다음 달 1일'을 계산합니다. (Target Report Month)
-        policy_year = latest_policy_date.year
-        policy_month = latest_policy_date.month
-        
-        # 다음 달 계산 (12월 -> 다음 해 1월로 정확히 넘어감)
-        next_month = (policy_month % 12) + 1
-        next_year = policy_year + (1 if policy_month == 12 else 0)
-        target_report_month_start = date(next_year, next_month, 1)
-        
-        # 2. 현재 요청된 보고서 월의 시작일을 계산합니다.
-        report_month_start = report_month.replace(day=1)
-        
-        # 3. Target Month가 아니라면, 변동 없음 처리 (이미 보고되었거나, 아직 정책 시행 전)
-        if report_month_start != target_report_month_start:
-            
-            # A. 보고서 월이 정책 시행일보다 이전인 경우 (아직 정책 시행 전이거나 파일 날짜 이전)
-            if report_month < latest_policy_date:
-                policy_analysis_report = f"{report_month.strftime('%Y년 %m월')} 보고서 기준, **최신 정책 문서({latest_policy_date.strftime('%Y년 %m월 %d일')})**가 아직 유효하지 않아 정책 변동 사항은 없습니다."
-            
-            # B. 보고서 월이 정책 시행 월보다 이후인 경우 (이미 지난달에 보고 완료)
-            else: 
-                policy_analysis_report = f"최신 정책 문서({latest_policy_date.strftime('%Y년 %m월 %d일')})의 변동 사항은 이미 {target_report_month_start.strftime('%Y년 %m월')} 보고서에 반영되었으며, 현재({report_month_start.strftime('%Y년 %m월')}) 기준으로 새로운 정책 변동 사항은 확인되지 않았습니다."
-            
-            # 결과 반환
-            return {
-                "tool_name": "check_and_report_policy_changes_tool", 
-                "success": True, 
-                "analysis_report": policy_analysis_report,
-                "policy_changes": [],
-                "error": None,
-            }
-        
     except ValueError:
-        analysis_report = "유효하지 않은 보고서 월 형식입니다."
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
             "success": False, 
-            "analysis_report": analysis_report, # KEY CHANGE
             "policy_changes": [],
-            "error": "보고서 월 형식 오류",
+            "error": "보고서 월 형식 오류"
         }
     
     # ----------------------------------------------------------------------
-    # 4. [통과] 보고서 월이 Target Month와 일치하므로, 변동사항 추출 시작
+    # 2. ⚙️ 정책 섹션별로 RAG 검색 실행 (지정된 파일만 대상)
     # ----------------------------------------------------------------------
-    
-    # 2. ⚙️ 정책 섹션별로 RAG 검색 실행 (최신 파일만 대상)
     full_context_list = []
-    
-    # 🎯 [수정] 정책 누락 방지를 위해 RAG 검색 깊이 K_SEARCH를 7로 유지합니다.
-    K_SEARCH = 7 
+    K_SEARCH = 15  # 각 섹션당 검색할 청크 수 (7 -> 15로 증가)
+ 
     
     for section_query in POLICY_SECTIONS_TO_CHECK:
         rag_context = _rag_similarity_search(
@@ -676,65 +555,47 @@ async def api_check_policy_changes(
         if "🚨 RAG 검색 실패" not in rag_context:
             full_context_list.append(rag_context)
         else:
-            # RAG 검색 자체의 시스템 오류는 500이 아닌 툴 에러로 처리
              return {
                 "tool_name": "check_and_report_policy_changes_tool", 
                 "success": False, 
-                "analysis_report": "정책 변동 분석 시스템 오류: RAG 검색 실패", # KEY CHANGE
                 "policy_changes": [],
-                "error": rag_context,
+                "error": rag_context
             }
 
     combined_context = "\n---\n".join(full_context_list)
     
-    # 3. 📝 [핵심 변경] 정규표현식을 이용해 RAG 컨텍스트에서 마커 포함 구문 추출
-    structured_changes_raw = _find_policies_by_marker_regex(combined_context)
+    # 디버깅: combined_context의 일부를 출력
+    logger.info(f"RAG: combined_context 길이: {len(combined_context)} 문자")
+    logger.info(f"RAG: combined_context 샘플 (처음 500자):\n{combined_context[:500]}")
     
-    # 4. 🎯 [최종 파이썬 필터링] 최신 정책 파일 날짜 이전 항목 제거
-    filtered_changes = []
+    # 3. 📝 정규표현식을 이용해 RAG 컨텍스트에서 마커 포함 구문 추출
+    # 정책 파일 날짜를 target_date로 전달하여 해당 날짜의 변경사항만 필터링
+    target_policy_date = latest_policy_date.strftime("%Y-%m-%d")
+    structured_changes_raw = _find_policies_by_marker_regex(combined_context, target_date=target_policy_date)
     
-    for change in structured_changes_raw:
-        effective_date_str = change.get("effective_date")
-        if not effective_date_str or effective_date_str == "N/A":
-            continue
-            
-        try:
-            effective_date = datetime.strptime(effective_date_str, "%Y-%m-%d").date()
-            
-            # [최종 필터링] 시행일이 MINIMUM_FILTER_DATE_DT (최신 정책 파일 날짜)와 같거나 이후인 경우만 포함
-            if effective_date >= MINIMUM_FILTER_DATE_DT:
-                filtered_changes.append(change)
-                
-        except ValueError:
-            # 날짜 형식 오류가 발생한 항목은 제외
-            continue
-            
-    structured_changes = filtered_changes
-
-    # 5. 🧩 추출 결과 처리 (변동 사항이 없는 경우에도 Target Month라면, 정책 파일 자체에 변동 사항이 없는 경우)
+    # 4. 🎯 최종 파이썬 필터링
+    # 🚨 [수정]: 정책 파일이 이미 선택되었으므로, 해당 파일 내 모든 신설/개정 사항을 사용합니다.
+    structured_changes = structured_changes_raw
+    
+    # 5. 🧩 추출 결과 처리 (변동 사항이 없는 경우)
     if not structured_changes:
-        # 정책 파일은 최신인데, 그 안에 마커로 표시된 신설/개정 사항이 하나도 없는 경우
-        policy_analysis_report = f"{report_month.strftime('%Y년 %m월')} 보고서 기준, 최신 정책 문서({latest_policy_date.strftime('%Y년 %m월 %d일')})에 **신설 또는 개정된 정책 변동 사항은 확인되지 않았습니다.**"
+        # 정책 파일은 있었으나, 해당 파일에서 마커를 포함한 정책 변동 사항이 추출되지 않은 경우
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
             "success": True, 
-            "analysis_report": policy_analysis_report, # KEY CHANGE
             "policy_changes": [],
-            "error": None,
+            "report_month": report_month.strftime('%Y년 %m월'),
+            "policy_date": latest_policy_date.strftime('%Y년 %m월 %d일'),
+            "message": f"{report_month.strftime('%Y년 %m월')} 보고서 기준, 최신 정책 문서({latest_policy_date.strftime('%Y년 %m월 %d일')})에 신설 또는 개정된 정책 변동 사항은 확인되지 않았습니다."
         }
 
-    # 6. 📝 LLM에게 분석 요청 및 최종 보고서 생성
-    report_result = _generate_final_report_from_structured_data(report_month_str, structured_changes)
-    
-    final_analysis_report = report_result['analysis_report']
-    
-    # 7. 🎯 최종 아웃풋 구성
+    # 6. 🎯 최종 아웃풋 구성 (Agent가 분석 보고서 생성)
     return {
         "tool_name": "check_and_report_policy_changes_tool", 
-        "success": report_result['error'] is None, 
-        "analysis_report": final_analysis_report, # KEY CHANGE
-        "policy_changes": structured_changes, # Python이 찾은 정확한 리스트를 반환
-        "error": report_result['error']
+        "success": True, 
+        "policy_changes": structured_changes,
+        "report_month": report_month.strftime('%Y년 %m월'),
+        "policy_date": latest_policy_date.strftime('%Y년 %m월 %d일')
     }
 
 
@@ -749,74 +610,47 @@ async def api_check_policy_changes(
     response_model=dict,
 )
 async def api_analyze_investment_profit(products: List[Dict[str, Any]] = Body(..., embed=True)) -> dict:
-    """보유 상품 목록을 기반으로 손익 분석 및 조언을 생성합니다."""
+    """보유 상품 목록을 기반으로 손익 데이터를 계산합니다. (LLM 호출 제거 - Agent가 처리)"""
     
     if not products:
         return {
             "tool_name": "analyze_investment_profit_tool", 
             "success": True, 
-            "error": None,
-            "profit_analysis_report": "현재 보유 중인 투자 상품이 없어 분석을 건너킵니다."
+            "total_principal": 0,
+            "total_valuation": 0,
+            "net_profit": 0,
+            "profit_rate": 0.0,
+            "products_count": 0,
+            "message": "현재 보유 중인 투자 상품이 없어 분석을 건너킵니다."
         }
 
-    # 1. 📊 상품 데이터 처리 (분석)
     total_principal = 0
     total_valuation = 0
     
-    # 🎯 실제 DB 스키마에 따라 total_principal, current_valuation 필드를 가정
     for p in products:
-        principal = p.get('total_principal', 0)
-        valuation = p.get('current_valuation', 0)
+        principal = p.get('total_principal', 0) or 0
+        valuation = p.get('current_valuation', 0) or 0
         total_principal += principal
         total_valuation += valuation 
 
     net_profit = total_valuation - total_principal
     profit_rate = (net_profit / total_principal) * 100 if total_principal else 0
     
-    # 2. 💬 [LLM] 분석 요청 (진척도 및 조언 생성)
-    data_summary = f"""
-    [투자 분석 요약]
-    - 총 투자 원금: {total_principal:,}원
-    - 현재 평가액: {total_valuation:,}원
-    - 순손익: {net_profit:+,}원
-    - 수익률: {profit_rate:.2f}%
-    - 보유 상품 수: {len(products)}개
-    """
-    
-    prompt = f"""
-    [System] 당신은 전문 투자 조언가입니다. 아래 투자 분석 요약을 보고, 고객에게 현재의 투자 진척도(수익률)에 대해 평가하고 **다음 단계의 투자 전략**에 대한 조언을 5줄 이내로 간결하고 정중하게 한국어로 작성하십시오. (예: "안정적인 수익률이지만, 목표를 달성하려면 분산 투자를 고려해야 합니다.")
-    
-    {data_summary}
-    
-    [투자 진척도 평가 및 조언]
-    """
-    
-    payload = {"model": QWEN_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.5}}
-    
-    try:
-        response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-        profit_analysis_report = response.json()['response'].strip()
-        
-        return {
-            "tool_name": "analyze_investment_profit_tool", 
-            "success": True, 
-            "profit_analysis_report": profit_analysis_report,
-            "net_profit": net_profit,
-            "profit_rate": profit_rate,
-            "error": None
-        }
+    return {
+        "tool_name": "analyze_investment_profit_tool", 
+        "success": True, 
+        "total_principal": int(total_principal),
+        "total_valuation": int(total_valuation),
+        "net_profit": int(net_profit),
+        "profit_rate": round(profit_rate, 2),
+        "products_count": len(products)
+    }
 
-    except Exception as e:
-        logger.error(f"투자 상품 분석 오류: {e}")
-        return {
-            "tool_name": "analyze_investment_profit_tool", 
-            "success": False, 
-            "error": f"투자 상품 분석 시스템 오류: {e}"
-        }
 
-# ------------------------------------------------------------------
-# 🎯 [신규] Tool 5: 사용자 프로필 변동 분석 및 보고서 생성 (추가됨)
-# ------------------------------------------------------------------
+
+# ==============================================================================
+# 독립 Tool 5: 사용자 프로필 변동 분석 및 보고서 생성 - 🌟 최종 안정화
+# ==============================================================================
 @router.post(
     "/analyze_user_profile_changes",
     summary="사용자 개인 지수 변동 분석 및 보고서 생성",
@@ -828,66 +662,48 @@ async def analyze_user_profile_changes(
     current_data: Dict[str, Any] = Body(..., embed=True),
     previous_data: Dict[str, Any] = Body(..., embed=False)
 ) -> dict:
-    """사용자의 연봉, 부채, 신용 점수 변동 사항을 분석하고 보고서를 생성합니다."""
+    """사용자의 연봉, 부채, 신용 점수 변동 데이터를 계산합니다. (LLM 호출 제거 - Agent가 처리)"""
     
     # 1. 📊 데이터 비교 및 요약
     change_raw_changes = []
     
-    # [연봉 비교]
-    current_salary = current_data.get('annual_salary', 0) or 0
-    previous_salary = previous_data.get('annual_salary', 0) or 0
-    salary_diff = current_salary - previous_salary
-    if salary_diff != 0:
-        change_raw_changes.append(f"연봉 변동: {previous_salary:,}원 → {current_salary:,}원 ({salary_diff:+,}원)")
-    
-    # [부채 비교]
-    current_debt = current_data.get('total_debt', 0) or 0
-    previous_debt = previous_data.get('total_debt', 0) or 0
-    debt_diff = current_debt - previous_debt
-    if debt_diff != 0:
-        change_raw_changes.append(f"총 부채 변동: {previous_debt:,}원 → {current_debt:,}원 ({debt_diff:+,}원)")
+    # 비교 대상 필드 리스트
+    fields_to_compare = [
+        ('annual_salary', '연봉'), 
+        ('total_debt', '총 부채'), 
+        ('credit_score', '신용 점수')
+    ]
 
-    # [신용 점수 비교]
-    current_credit = current_data.get('credit_score', 0) or 0
-    previous_credit = previous_data.get('credit_score', 0) or 0
-    credit_diff = current_credit - previous_credit
-    if credit_diff != 0:
-        change_raw_changes.append(f"신용 점수 변동: {previous_credit}점 → {current_credit}점 ({credit_diff:+,}점)")
+    is_first_report = all(v == 0 for k, v in previous_data.items() if k in ['annual_salary', 'total_debt', 'credit_score'])
     
-    analysis_summary = "\n".join(change_raw_changes) if change_raw_changes else "직전 보고서 대비 주요 개인 금융 지표(연봉, 부채, 신용 점수)의 변동 사항은 없습니다."
+    for field, name in fields_to_compare:
+        current_value = current_data.get(field, 0) or 0
+        previous_value = previous_data.get(field, 0) or 0
+        
+        current_value = int(current_value)
+        previous_value = int(previous_value)
+
+        diff = current_value - previous_value
+        
+        # 🚨 [수정]: 첫 보고서가 아닐 때만 0이 아닌 유의미한 변동을 비교
+        if not is_first_report and diff != 0:
+            change_raw_changes.append(f"{name} 변동: {previous_value:,}원 → {current_value:,}원 ({diff:+,}원)")
+        # 🚨 [추가]: 첫 보고서이고, 현재 데이터가 0이 아닌 경우 현재 상태만 기록
+        elif is_first_report and current_value != 0:
+             change_raw_changes.append(f"최초 기록 {name}: {current_value:,}원")
     
-    # 2. 💬 LLM 프롬프트 생성 (변동 사항 분석 요청)
     if not change_raw_changes:
-        change_analysis_report = "직전 보고서 대비 고객님의 주요 개인 지표(연봉, 부채, 신용 점수)에 큰 변동 사항이 없어 특이 보고는 생략합니다."
-        success = True
-    else:
-        prompt = f"""
-        [System] 당신은 고객의 개인 금융 지표(연봉, 부채, 신용 점수) 변동 분석가입니다. 아래 비교 결과를 바탕으로 고객에게 전달할 4줄의 **간결하고 정중한** 변동 분석 보고서와 개인 재정 상황에 맞는 조언을 한국어로 작성하십시오.
-        
-        [지표 변동 결과]
-        {analysis_summary}
-        
-        [보고서 형식]
-        1. 신용 점수 변화를 포함하여 지표 변동의 핵심 요약
-        2. 부채/연봉 변화에 따른 재정 건전성 평가
-        3. 변동된 상황을 바탕으로 다음 단계에서 고려해야 할 재정 조언
-        """
-        
-        payload = {"model": QWEN_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.5}}
-        
-        try:
-            response = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180) 
-            change_analysis_report = response.json()['response'].strip()
-            success = True
-        except Exception as e:
-            logger.error(f"사용자 변동 분석 LLM 오류: {e}")
-            change_analysis_report = "사용자 변동 분석 보고서 생성 중 오류 발생"
-            success = False
-
-    # 🎯 [수정 완료] 아웃풋 필드명을 요청하신대로 변경
+        return {
+            "tool_name": "analyze_user_profile_changes_tool",
+            "success": True,
+            "change_raw_changes": [],
+            "is_first_report": is_first_report,
+            "message": "직전 보고서 대비 주요 개인 금융 지표(연봉, 부채, 신용 점수)의 변동 사항은 없습니다."
+        }
+    
     return {
-        "tool_name": "analyze_user_profile_changes_tool", 
-        "success": success, 
-        "change_analysis_report": change_analysis_report,
-        "change_raw_changes": change_raw_changes
+        "tool_name": "analyze_user_profile_changes_tool",
+        "success": True,
+        "change_raw_changes": change_raw_changes,
+        "is_first_report": is_first_report
     }
