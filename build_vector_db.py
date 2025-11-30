@@ -21,7 +21,7 @@ ENV_VALUES = dotenv_values(find_dotenv(usecwd=True, raise_error_if_not_found=Fal
 HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", ENV_VALUES.get("HF_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B"))
 
 VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", ENV_VALUES.get("VECTOR_DB_PATH", '../data/faiss_index'))
-POLICY_DIR = "../data/policy_documents"
+POLICY_DIR = "./data/policy_documents"
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN", ENV_VALUES.get("HUGGINGFACEHUB_API_TOKEN")) 
 
 

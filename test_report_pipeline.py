@@ -5,7 +5,6 @@ from typing import Dict, Any, List
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
-# 🚨 주의: 실제 파일 경로에 맞게 임포트 경로를 수정해야 합니다.
 from server.api.resources.report_db_tools import api_get_member_details, api_fetch_user_consume_data, api_fetch_recent_report_summary, api_fetch_user_products, api_save_monthly_report
 from server.api.tools.report_agent_tools import (
     analyze_user_spending, 
@@ -178,7 +177,7 @@ async def run_report_pipeline_monthly(report_date_str: str, consume_dates: List[
 async def main_orchestrator():
     # 🚨 실행 기간 설정: 2023년 1월 ~ 2023년 2월 (2개월 테스트)
     START_DATE = (2023, 12) # 2023-01-01 저장일 (2022년 12월 보고서)
-    END_DATE = (2024, 1)   # 2023-02-01 저장일 (2023년 1월 보고서)
+    END_DATE = (2025, 9)   # 2023-02-01 저장일 (2023년 1월 보고서)
     
     report_dates_str = get_report_months(START_DATE[0], START_DATE[1], END_DATE[0], END_DATE[1])
     

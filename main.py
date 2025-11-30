@@ -1,3 +1,18 @@
+import os
+import sys
+from pathlib import Path
+
+# ----------------------------------------------------
+# 🚨 [모듈 경로 수정]: Python이 'mcp' 패키지를 찾도록 경로를 명확히 추가
+# ----------------------------------------------------
+
+# 현재 main.py가 있는 디렉토리(루트 디렉토리)를 sys.path에 추가합니다.
+# 이렇게 하면 'mcp' 디렉토리를 패키지 루트로 인식하게 됩니다.
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+
+# ----------------------------------------------------
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from config.logger import get_logger
@@ -46,6 +61,7 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     logger.info("Starting FastAPI + FastMCP Server (HTTP)")
     logger.info("=" * 60)
+    # 🚨 [포트 설정 유지]: 포트 8888을 사용하고 있습니다.
     uvicorn.run(
         "main:app",
         host="0.0.0.0",

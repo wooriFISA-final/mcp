@@ -53,11 +53,13 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # RAG 및 정책 검색에 필요한 환경 변수만 로드합니다.
 HF_EMBEDDING_MODEL = ENV_VALUES.get("HF_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-8B")
-VECTOR_DB_PATH = ENV_VALUES.get("VECTOR_DB_PATH", '../data/faiss_index')
+VECTOR_DB_PATH = ENV_VALUES.get("VECTOR_DB_PATH", './data/faiss_index')
 HUGGINGFACEHUB_API_TOKEN = ENV_VALUES.get("HUGGINGFACEHUB_API_TOKEN")
 
+
+
 # 🚨 [추가] 정책 문서 디렉토리 경로
-POLICY_DIR = "../data/policy_documents"
+POLICY_DIR = "./data/policy_documents"
 
 
 router = APIRouter(
@@ -423,18 +425,23 @@ async def analyze_user_spending(
         change_rate = (diff / total_spend_prev) * 100 if total_spend_prev else 0
         change_text = f"{diff:+,}원 ({change_rate:.2f}%) 변동"
 
-        # CAT1 컬럼 목록 생성 (JSON 키 기반)
-        cat1_cols = [col for col in latest_data.index if col.startswith('CAT1_')]
+        # 🚨 [수정] 소분류(CAT2) 우선 사용, 없으면 대분류(CAT1) 사용
+        cat2_cols = [col for col in latest_data.index if col.startswith('CAT2_')]
+        target_cols = cat2_cols if cat2_cols else [col for col in latest_data.index if col.startswith('CAT1_')]
+        prefix = 'CAT2_' if cat2_cols else 'CAT1_'
         
-        # Top 5 카테고리 추출
-        latest_cats = df_consume.iloc[0][cat1_cols].sort_values(ascending=False).head(5) 
+        # Top 5 카테고리 추출 (분석 텍스트용 - 여전히 대분류 기준이 좋을 수 있으나, 일관성을 위해 target_cols 사용)
+        # 만약 분석 텍스트는 대분류로 유지하고 싶다면 cat1_cols를 별도로 구해야 함.
+        # 여기서는 차트와 일관되게 소분류가 있으면 소분류 Top 5를 사용하도록 변경함.
+        latest_cats = df_consume.iloc[0][target_cols].sort_values(ascending=False).head(5) 
         
-        # spend_chart_json을 위한 전체 CAT1 카테고리별 금액 계산
+        # spend_chart_json을 위한 전체 카테고리별 금액 계산
         chart_data_list = []
-        for col in cat1_cols:
+        for col in target_cols:
             amount = latest_data.get(col, 0) or 0
             if amount > 0:
-                label = col.replace('CAT1_', '').replace('_', ' ').replace(' ', '/') 
+                # 라벨 정제: 접두사 제거 및 언더바를 공백/슬래시로 변환
+                label = col.replace(prefix, '').replace('_', ' ').replace(' ', '/') 
                 chart_data_list.append({
                     "category": label,
                     "amount": int(amount)

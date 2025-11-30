@@ -17,7 +17,7 @@ from langchain_community.vectorstores import FAISS
 
 # 3. RAG 설정 변수 로드
 HF_EMBEDDING_MODEL = os.getenv("HF_EMBEDDING_MODEL", 'Qwen/Qwen3-Embedding-8B')
-VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", '../data/faiss_index')
+VECTOR_DB_PATH = os.getenv("VECTOR_DB_PATH", './data/faiss_index')
 HUGGINGFACEHUB_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 
