@@ -78,9 +78,9 @@ class NormalizeLocationResponse(BaseModel):
 # ============================================================
 
 class ParseRatioRequest(BaseModel):
-    value: Any = Field(
+    value: str = Field(
         ...,
-        description="비율 파싱 (문자열 또는 정수)",
+        description="비율 파싱",
     )
 
 
@@ -101,103 +101,30 @@ class ParseRatioResponse(BaseModel):
 # 5) validate_input_data --------------------------------------
 # ============================================================
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Any, Dict, List, Optional, Literal
-
 class ValidateInputRequest(BaseModel):
     """
-    주택 계획 입력값 검증 요청
-    
-    두 가지 형식 지원:
-    1. 래퍼 구조 (권장): {"data": {"initial_prop": ..., "hope_location": ...}}
-    2. 평탄한 구조: {"initial_prop": ..., "hope_location": ...}
-    
+    LLM/클라이언트가 보내는 원시(raw) 입력 데이터.
+
     예시:
-```json
-    {
-      "initial_prop": "3억",
-      "hope_location": "서울 동작구",
-      "hope_price": "10억",
-      "hope_housing_type": "아파트",
-      "income_usage_ratio": "30%"
-    }
-```
-    또는
-```json
     {
       "data": {
         "initial_prop": "3억",
         "hope_location": "서울 동작구",
         "hope_price": "10억",
         "hope_housing_type": "아파트",
-        "income_usage_ratio": "30%"
+        "income_usage_ratio": "30%",
+        "ratio_str": "30:40:30"   # 예금:적금:펀드 비율
       }
     }
-```
     """
-    
-    # 래퍼 구조용 (Optional)
-    data: Optional[Dict[str, Any]] = Field(
-        None,
+    data: Dict[str, Any] = Field(
+        ...,
         description=(
-            "검증할 입력 데이터 (딕셔너리). "
-            "필수 필드: initial_prop, hope_location, hope_price, "
-            "hope_housing_type, income_usage_ratio"
-        )
+            "주택 계획 입력값 "
+            "(initial_prop, hope_location, hope_price, "
+            "hope_housing_type, income_usage_ratio, ratio_str 등)"
+        ),
     )
-    
-    # 평탄한 구조용 (Optional)
-    initial_prop: Optional[Any] = Field(
-        None,
-        description="초기 자산 (예: '3천만', 30000000)"
-    )
-    hope_location: Optional[str] = Field(
-        None,
-        description="희망 지역 (예: '서울 동작구')"
-    )
-    hope_price: Optional[Any] = Field(
-        None,
-        description="희망 가격 (예: '7억', 700000000)"
-    )
-    hope_housing_type: Optional[str] = Field(
-        None,
-        description="주택 유형 (예: '아파트')"
-    )
-    income_usage_ratio: Optional[Any] = Field(
-        None,
-        description="월급 사용 비율 (예: '30%', 30)"
-    )
-    ratio_str: Optional[str] = Field(
-        None,
-        description="예금:적금:펀드 비율 (예: '30:40:30')"
-    )
-    
-    @model_validator(mode='after')
-    def normalize_structure(self):
-        """두 가지 입력 형식을 data 구조로 통일"""
-        # 이미 data가 있으면 그대로 사용
-        if self.data:
-            return self
-        
-        # 평탄한 구조인 경우 data로 변환
-        flat_fields = {
-            "initial_prop": self.initial_prop,
-            "hope_location": self.hope_location,
-            "hope_price": self.hope_price,
-            "hope_housing_type": self.hope_housing_type,
-            "income_usage_ratio": self.income_usage_ratio,
-        }
-        
-        # ratio_str이 있으면 추가
-        if self.ratio_str:
-            flat_fields["ratio_str"] = self.ratio_str
-        
-        # None이 아닌 필드가 하나라도 있으면 평탄한 구조로 간주
-        if any(v is not None for v in flat_fields.values()):
-            # None이 아닌 필드만 data에 포함
-            self.data = {k: v for k, v in flat_fields.items() if v is not None}
-        
-        return self
 
 
 class ValidateInputResponse(BaseModel):
@@ -446,7 +373,6 @@ class CalculatePortfolioAmountsResponse(BaseModel):
 # ============================================================
 
 class GetMarketPriceRequest(BaseModel):
-    user_house_price: str = Field(..., description="사용자가 입력한 희망 주택 가격")
     location: str = Field(..., description="지역명 (예: '서울특별시 마포구')")
     housing_type: Literal["아파트", "오피스텔", "연립다세대", "단독다가구"] = Field(
         ...,
@@ -455,11 +381,11 @@ class GetMarketPriceRequest(BaseModel):
 
 
 class GetMarketPriceResponse(BaseModel):
-    tool_name: Literal["check_house_price"] = Field(
-        "check_house_price",
+    tool_name: Literal["get_market_price"] = Field(
+        "get_market_price",
         description="Tool 이름",
     )
-    success: bool = Field(..., description="주택 가격 부합 여부")
+    success: bool = Field(..., description="조회 성공 여부")
     avg_price: int = Field(..., description="평균 시세(원 단위, 없으면 0)")
     error: Optional[str] = Field(
         None,
@@ -682,6 +608,42 @@ class GetSavingsCandidatesResponse(BaseModel):
         description="오류 메시지(실패 시)",
     )
 
+
+# ============================================================
+# 9) /input/recommend_savings_products ----------------------
+# ============================================================
+
+class RecommendSavingsProductsRequest(BaseModel):
+    user_data: Dict[str, Any] = Field(
+        ...,
+        description="추천에 사용할 사용자 프로필(dict)",
+    )
+    top_k: int = Field(
+        3,
+        description="예금/적금 각각 추천 개수 (기본 3)",
+    )
+
+
+class RecommendSavingsProductsResponse(BaseModel):
+    tool_name: Literal["recommend_savings_products"] = Field(
+        "recommend_savings_products",
+        description="예/적금 3+3 추천 Tool",
+    )
+    success: bool = Field(..., description="처리 성공 여부")
+    top_deposits: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="예금 추천 Top K 리스트",
+    )
+    top_savings: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="적금 추천 Top K 리스트",
+    )
+    error: Optional[str] = Field(
+        None,
+        description="오류 메시지(실패 시)",
+    )
+
+
 # ============================================================
 # 12. [Fund] 사용자 투자 성향 조회
 # ============================================================
@@ -764,10 +726,17 @@ class GetInvestmentRatioResponse(BaseModel):
 
 class SaveUserPortfolioRequest(BaseModel):
     user_id: int = Field(..., description="사용자 ID")
-    initial_prop: str = Field(..., description = "사용자가 입력한 초기 자산 금액")
-    income_usage_ratio: str = Field(
+    deposit_amount: int = Field(
         ...,
-        description="예금,적금, 펀드 배분 비율(예금:적금:펀드)",
+        description="예금 배분 금액(원). DB에서는 members.deposite_amount 로 저장",
+    )
+    savings_amount: int = Field(
+        ...,
+        description="적금 배분 금액(원). DB에서는 members.saving_amount 로 저장",
+    )
+    fund_amount: int = Field(
+        ...,
+        description="펀드 배분 금액(원). DB에서는 members.fund_amount 로 저장",
     )
 
 
@@ -844,10 +813,6 @@ class SelectedProductAmount(BaseModel):
     end_date: Optional[str] = Field(
         None,
         description="만기일 (yyyy-MM-dd 문자열, 없으면 None)",
-    )
-    product_description: Optional[str] = Field(
-        None,
-        description="LLM이 작성한 상품 설명",
     )
 
 
@@ -988,9 +953,9 @@ class ValidateSelectedFundsProductsRequest(BaseModel):
         ...,
         description="펀드 배정 가능 총액 (members.fund_amount)",
     )
-    selected_funds: List[Dict[str, Any]] = Field(
+    selected_funds: List[SelectedFundAmount] = Field(
         default_factory=list,
-        description="사용자가 선택한 펀드 + 금액 목록 (각 항목: fund_name 또는 product_name, amount)",
+        description="사용자가 선택한 펀드 + 금액 목록",
     )
 
 
@@ -1030,7 +995,7 @@ class SaveSelectedFundItem(BaseModel):
     amount: int = Field(..., description="투자 금액(원)")
     fund_description: Optional[str] = Field(
         None,
-        description="펀드 설명",
+        description="펀드 간단 설명(선택)",
     )
     expected_yield: Optional[float] = Field(
         None,
@@ -1065,6 +1030,53 @@ class SaveSelectedFundsProductsResponse(BaseModel):
         None,
         description="에러 발생 시 에러 메시지",
     )
+
+##### 예금 적금 상품 수정 코드
+
+# ============================================================
+# 18. [DB Tools] 예금/적금 전체 상품 조회 (FAISS)
+# ============================================================
+
+class GetAllDepositProductsRequest(BaseModel):
+    """모든 예금 상품 조회 요청 (필터링 없음)"""
+    pass  # 파라미터 없음
+
+
+class GetAllDepositProductsResponse(BaseModel):
+    """모든 예금 상품 조회 응답"""
+    tool_name: Literal["get_all_deposit_products"] = Field(
+        "get_all_deposit_products",
+        description="전체 예금 상품 조회 Tool 이름"
+    )
+    success: bool = Field(..., description="조회 성공 여부")
+    products: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="전체 예금 상품 목록"
+    )
+    total_count: int = Field(0, description="총 상품 개수")
+    error: Optional[str] = Field(None, description="오류 메시지(실패 시)")
+
+
+class GetAllSavingProductsRequest(BaseModel):
+    """모든 적금 상품 조회 요청 (필터링 없음)"""
+    pass  # 파라미터 없음
+
+
+class GetAllSavingProductsResponse(BaseModel):
+    """모든 적금 상품 조회 응답"""
+    tool_name: Literal["get_all_saving_products"] = Field(
+        "get_all_saving_products",
+        description="전체 적금 상품 조회 Tool 이름"
+    )
+    success: bool = Field(..., description="조회 성공 여부")
+    products: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="전체 적금 상품 목록"
+    )
+    total_count: int = Field(0, description="총 상품 개수")
+    error: Optional[str] = Field(None, description="오류 메시지(실패 시)")
+
+
 # ============================================================
 # 19. [Plan Agent Tools] 사용자 기반 예금/적금 추천 (FAISS)
 # ============================================================
@@ -1105,254 +1117,3 @@ class RecommendDepositSavingProductsResponse(BaseModel):
         description="메타 정보 (검색 쿼리, 사용된 조건 등)"
     )
     error: Optional[str] = Field(None, description="오류 메시지(실패 시)")
-    
-    
-# plan_schema.py파일에 추가할 코드
-# ============================================================
-
-# 18) LTV 계산
-# ============================================================
-
-class CalculateLTVRequest(BaseModel):
-    user_id: int = Field(..., description="사용자 ID (members.user_id)")
-    target_price: int = Field(..., description="목표 주택 가격 (원 단위)")
-    is_regulated_area: bool = Field(
-        False,
-        description="규제지역 여부"
-    )
-
-class CalculateLTVResponse(BaseModel):
-    tool_name: Literal["calculate_ltv"] = Field(
-        "calculate_ltv",
-        description="LTV(Loan To Value) 비율 계산"
-    )
-    success: bool = Field(..., description="처리 성공 여부")
-    ltv_ratio: Optional[float] = Field(
-        None,
-        description="적용된 LTV 비율(%)"
-    )
-    max_loan_amount: Optional[int] = Field(
-        None,
-        description="LTV 기준 최대 대출 가능 금액 (원)"
-    )
-    reason: Optional[str] = Field(
-        None,
-        description="LTV 산정 근거"
-    )
-    regional_avg_price: Optional[int] = Field(
-        None,
-        description="지역 평균 가격 (원, 참고용)"
-    )
-    error: Optional[str] = Field(
-        None,
-        description="오류 메시지(실패 시)"
-    )
-
-
-# ============================================================
-# 19) 대출 상품 조회
-# ============================================================
-
-class GetLoanProductRequest(BaseModel):
-    product_id: Optional[int] = Field(
-        None,
-        description="대출 상품 ID (없으면 첫 번째 주택담보대출 상품 반환)"
-    )
-
-class GetLoanProductResponse(BaseModel):
-    tool_name: Literal["get_loan_product"] = Field(
-        "get_loan_product",
-        description="주택담보대출 상품 조회"
-    )
-    success: bool = Field(..., description="조회 성공 여부")
-    product_id: Optional[int] = Field(None, description="상품 ID")
-    product_name: Optional[str] = Field(None, description="상품명")
-    bank_name: Optional[str] = Field(None, description="은행명")
-    product_type: Optional[str] = Field(None, description="상품 유형")
-    summary: Optional[str] = Field(None, description="상품 요약")
-    target_housing_type: Optional[str] = Field(None, description="대상 주택 유형")
-    rate_description: Optional[str] = Field(None, description="금리 조건")
-    repayment_method: Optional[str] = Field(None, description="상환 방식")
-    preferential_rate_info: Optional[str] = Field(None, description="우대 금리 정보")
-    error: Optional[str] = Field(None, description="오류 메시지")
-
-
-
-# ============================================================
-# 20) 최종 대출 금액 산정
-# ============================================================
-
-class CalculateFinalLoanRequest(BaseModel):
-    user_id: int = Field(..., description="사용자 ID (members.user_id)")
-    product_id: Optional[int] = Field(
-        1,
-        description="대출 상품 ID (기본값: 1)"
-    )
-    target_price: int = Field(..., description="목표 주택 가격 (원 단위)")
-    is_regulated_area: bool = Field(
-        False,
-        description="규제지역 여부"
-    )
-
-class CalculateFinalLoanResponse(BaseModel):
-    tool_name: Literal["calculate_final_loan"] = Field(
-        "calculate_final_loan",
-        description="최종 대출 금액 산정"
-    )
-    success: bool = Field(..., description="처리 성공 여부")
-    approved_amount: Optional[int] = Field(
-        None,
-        description="대출 가능 금액 (원)"
-    )
-    down_payment_needed: Optional[int] = Field(
-        None,
-        description="필요 자기자본 (원)"
-    )
-    ltv_limit: Optional[int] = Field(
-        None,
-        description="LTV 제한 금액 (원)"
-    )
-    dsr_limit: Optional[int] = Field(
-        None,
-        description="DSR 제한 금액 (원)"
-    )
-    dti_limit: Optional[int] = Field(
-        None,
-        description="DTI 제한 금액 (원)"
-    )
-    final_limit_reason: Optional[str] = Field(
-        None,
-        description="최종 제한 사유"
-    )
-    monthly_payment_estimate: Optional[int] = Field(
-        None,
-        description="예상 월 상환액 (원)"
-    )
-    loan_product: Optional[Dict[str, Any]] = Field(
-        None,
-        description="적용된 대출 상품 정보"
-    )
-    user_summary: Optional[Dict[str, Any]] = Field(
-        None,
-        description="사용자 요약 정보"
-    )
-    error: Optional[str] = Field(
-        None,
-        description="오류 메시지(실패 시)"
-    )    
-    
-
-# ============================================================
-# [Summary Agent] 사용자 전체 프로필 조회
-# ============================================================
-class GetUserFullProfileRequest(BaseModel):
-    """Plan 보고서 생성을 위한 사용자 전체 프로필 조회 요청"""
-    user_id: int = Field(..., description="사용자 ID")
-
-
-class GetUserFullProfileResponse(BaseModel):
-    """Plan 보고서 생성을 위한 사용자 전체 프로필 조회 응답"""
-    tool_name: Literal["get_user_full_profile"] = Field(
-        "get_user_full_profile",
-        description="Plan 보고서용 사용자 전체 프로필 조회 Tool"
-    )
-    success: bool = Field(..., description="조회 성공 여부")
-    user_id: Optional[int] = Field(None, description="사용자 ID")
-    
-    # Members 테이블 정보
-    name: Optional[str] = Field(None, description="사용자 이름")
-    hope_location: Optional[str] = Field(None, description="희망 지역")
-    hope_price: Optional[int] = Field(None, description="희망 가격 (원)")
-    hope_housing_type: Optional[str] = Field(None, description="희망 주택 유형")
-    deposite_amount: Optional[int] = Field(None, description="예금 배분 금액 (원)")
-    saving_amount: Optional[int] = Field(None, description="적금 배분 금액 (원)")
-    fund_amount: Optional[int] = Field(None, description="펀드 배분 금액 (원)")
-    shortage_amount: Optional[int] = Field(None, description="부족 금액 (목표금액-(대출금액+현금+사용가능자산))")
-    initial_prop: Optional[int] = Field(None, description="초기 자산 (원)")
-    income_usage_ratio: Optional[int] = Field(None, description="사용 급여 비율 (%)")
-    
-    # Members_info 테이블 정보 (가장 오래된 데이터 기준)
-    monthly_salary: Optional[int] = Field(None, description="월 급여 (원)")
-    annual_salary: Optional[int] = Field(None, description="연봉 (원)")
-    
-    error: Optional[str] = Field(None, description="오류 메시지 (실패 시)")
-    
-# ============================================================
-# [Summary Agent] 사용자 선택 예금/적금/펀드 상품 조회
-# ============================================================
-class UserProductItem(BaseModel):
-    """사용자가 선택한 상품 단일 항목"""
-    product_name: str = Field(..., description="상품명")
-    product_type: Literal["예금", "적금", "펀드"] = Field(..., description="상품 유형")
-    current_value: int = Field(..., description="저축/투자 금액 (원)")
-    product_description: Optional[str] = Field(None, description="상품 간략 설명")
-
-
-class GetUserProductsRequest(BaseModel):
-    """사용자 선택 예금/적금/펀드 상품 조회 요청"""
-    user_id: int = Field(..., description="사용자 ID")
-
-
-class GetUserProductsResponse(BaseModel):
-    """사용자 선택 예금/적금/펀드 상품 조회 응답"""
-    tool_name: Literal["get_user_products"] = Field(
-        "get_user_products",
-        description="사용자가 선택한 예금/적금/펀드 상품 조회 Tool"
-    )
-    success: bool = Field(..., description="조회 성공 여부")
-    user_id: Optional[int] = Field(None, description="사용자 ID")
-    
-    deposit_products: List[UserProductItem] = Field(
-        default_factory=list,
-        description="예금 상품 목록"
-    )
-    savings_products: List[UserProductItem] = Field(
-        default_factory=list,
-        description="적금 상품 목록"
-    )
-    fund_products: List[UserProductItem] = Field(
-        default_factory=list,
-        description="펀드 상품 목록"
-    )
-    
-    total_deposit_count: int = Field(0, description="예금 상품 개수")
-    total_savings_count: int = Field(0, description="적금 상품 개수")
-    total_fund_count: int = Field(0, description="펀드 상품 개수")
-    
-    total_deposit_amount: int = Field(0, description="예금 총 금액 (원)")
-    total_savings_amount: int = Field(0, description="적금 총 금액 (원)")
-    total_fund_amount: int = Field(0, description="펀드 총 금액 (원)")
-    
-    error: Optional[str] = Field(None, description="오류 메시지 (실패 시)")
-    
-# ============================================================
-# [Summary Agent] Plan 보고서용 대출 정보 조회
-# ============================================================
-class GetUserLoanInfoRequest(BaseModel):
-    """Plan 보고서용 대출 정보 조회 요청"""
-    user_id: int = Field(..., description="사용자 ID")
-
-
-class GetUserLoanInfoResponse(BaseModel):
-    """Plan 보고서용 대출 정보 조회 응답"""
-    tool_name: Literal["get_user_loan_info"] = Field(
-        "get_user_loan_info",
-        description="Plan 보고서용 대출 정보 조회 Tool"
-    )
-    success: bool = Field(..., description="조회 성공 여부")
-    user_id: Optional[int] = Field(None, description="사용자 ID")
-    
-    # Plans 테이블 정보
-    loan_amount: Optional[int] = Field(None, description="대출 가능 금액 (원)")
-    
-    # loan_product 테이블 정보
-    product_name: Optional[str] = Field(None, description="대출 상품명")
-    bank_name: Optional[str] = Field(None, description="은행명")
-    summary: Optional[str] = Field(None, description="상품 요약")
-    rate_description: Optional[str] = Field(None, description="금리 조건")
-    limit_description: Optional[str] = Field(None, description="대출 한도 설명")
-    period_description: Optional[str] = Field(None, description="대출 기간")
-    repayment_method: Optional[str] = Field(None, description="상환 방식")
-    preferential_rate_info: Optional[str] = Field(None, description="우대 금리 정보")
-    
-    error: Optional[str] = Field(None, description="오류 메시지 (실패 시)")

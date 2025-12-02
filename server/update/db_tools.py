@@ -6,18 +6,16 @@ from datetime import date
 
 from fastapi import APIRouter, Body
 from sqlalchemy import create_engine, text
-from sqlalchemy.pool import QueuePool
-
 from dotenv import load_dotenv
-
+import faiss
+import pickle
+from pathlib import Path
 # ✅ Pydantic 스키마 임포트
 from server.schemas.plan_schema import (
     GetMarketPriceRequest,
     GetMarketPriceResponse,
     UpsertMemberAndPlanRequest,
     UpsertMemberAndPlanResponse,
-    SaveUserPortfolioRequest,
-    SaveUserPortfolioResponse,
     UpdateLoanResultRequest,
     UpdateLoanResultResponse,
     GetUserLoanOverviewRequest,
@@ -34,17 +32,62 @@ from server.schemas.plan_schema import (
     AddMyFundResponse,
     GetMemberInvestmentAmountsRequest,
     GetMemberInvestmentAmountsResponse,
+    GetAllDepositProductsRequest,
+    GetAllDepositProductsResponse,
+    GetAllSavingProductsRequest,
+    GetAllSavingProductsResponse,
     SaveSelectedSavingsProductsRequest,
     SaveSelectedSavingsProductsResponse,
     SaveSelectedFundsProductsRequest,
     SaveSelectedFundsProductsResponse,
-    GetUserFullProfileRequest,
-    GetUserFullProfileResponse,
-    GetUserProductsRequest,
-    GetUserProductsResponse,
-    GetUserLoanInfoRequest,
-    GetUserLoanInfoResponse
 )
+
+# ============================================================
+# FAISS 인덱스 전역 캐시 (db_tools.py용)
+# ============================================================
+_db_deposit_index = None
+_db_deposit_metadata = None
+_db_saving_index = None
+_db_saving_metadata = None
+
+def _load_deposit_faiss_data():
+    """예금 FAISS 메타데이터 로드 (db_tools용)"""
+    global _db_deposit_metadata
+    
+    if _db_deposit_metadata is None:
+        data_dir = Path(__file__).parent.parent.parent.parent / "data"
+        metadata_path = data_dir / "faiss_deposit_products" / "deposit_index.pkl"
+        
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"예금 메타데이터 파일을 찾을 수 없습니다: {metadata_path}")
+        
+        logger.info(f"📥 예금 메타데이터 로드 중: {metadata_path}")
+        with open(metadata_path, "rb") as f:
+            _db_deposit_metadata = pickle.load(f)
+        
+        logger.info(f"✅ 예금 메타데이터 로드 완료 ({len(_db_deposit_metadata)}개 상품)")
+    
+    return _db_deposit_metadata
+
+
+def _load_saving_faiss_data():
+    """적금 FAISS 메타데이터 로드 (db_tools용)"""
+    global _db_saving_metadata
+    
+    if _db_saving_metadata is None:
+        data_dir = Path(__file__).parent.parent.parent.parent / "data"
+        metadata_path = data_dir / "faiss_saving_products" / "saving_index.pkl"
+        
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"적금 메타데이터 파일을 찾을 수 없습니다: {metadata_path}")
+        
+        logger.info(f"📥 적금 메타데이터 로드 중: {metadata_path}")
+        with open(metadata_path, "rb") as f:
+            _db_saving_metadata = pickle.load(f)
+        
+        logger.info(f"✅ 적금 메타데이터 로드 완료 ({len(_db_saving_metadata)}개 상품)")
+    
+    return _db_saving_metadata
 
 # ----------------------------------
 # 🌐 환경 설정 및 로깅
@@ -53,25 +96,13 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("user")
+DB_PASSWORD = os.getenv("password")
+DB_HOST = os.getenv("host")
+DB_NAME = os.getenv("database")
 
-# 개선된 엔진 설정
-engine = create_engine(
-    f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}",
-    poolclass=QueuePool,
-    pool_size=5,                    # 기본 연결 풀 크기
-    max_overflow=10,                # 추가 연결 최대 개수
-    pool_timeout=30,                # 연결 대기 타임아웃
-    pool_recycle=3600,              # 1시간마다 연결 재생성 (MySQL wait_timeout 대응)
-    pool_pre_ping=True,             # ⭐ 중요: 쿼리 전 연결 유효성 검사
-    connect_args={
-        "connect_timeout": 10,      # 연결 타임아웃 10초
-    },
-    echo=False,                     # 개발 시 True로 설정하면 SQL 로깅
-)
+engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
+
 # ----------------------------------
 # 🛰️ 라우터 설정
 # ----------------------------------
@@ -84,37 +115,25 @@ router = APIRouter(
 # 1. state 테이블에서 지역+주택유형 평균 시세 조회
 # ============================================================
 @router.post(
-    "/check_house_price",
+    "/get_market_price",
     summary="지역·주택유형 평균 시세 조회",
-    operation_id="check_house_price",
+    operation_id="get_market_price",
     response_model=GetMarketPriceResponse,
 )
-async def api_check_house_price(
+async def api_get_market_price(
     payload: GetMarketPriceRequest = Body(...),
 ) -> GetMarketPriceResponse:
     """
-    state 테이블에서 지역 + 주택유형별 평균 시세를 조회하고,
-    사용자 희망 가격이 시세 범위(평균 ± 50%) 내에 있는지 검증하는 Tool.
+    state 테이블에서 지역 + 주택유형별 평균 시세를 조회하는 Tool.
     """
     location = payload.location.strip()
     housing_type = payload.housing_type.strip()
-    user_price_str = payload.user_house_price.strip()
 
     if not location or not housing_type:
         return GetMarketPriceResponse(
             success=False,
             avg_price=0,
             error="location과 housing_type은 필수입니다.",
-        )
-
-    # 사용자 입력 가격을 숫자로 변환
-    try:
-        user_price = int(user_price_str.replace(",", "").replace("원", "").replace("만", "0000"))
-    except ValueError:
-        return GetMarketPriceResponse(
-            success=False,
-            avg_price=0,
-            error="user_house_price를 숫자로 변환할 수 없습니다.",
         )
 
     try:
@@ -139,26 +158,9 @@ async def api_check_house_price(
                 {"loc": location, "housing_type": housing_type},
             ).scalar()
 
-        if avg_price is None or avg_price == 0:
-            return GetMarketPriceResponse(
-                success=False,
-                avg_price=0,
-                error=f"'{location}'의 '{housing_type}' 시세 정보를 찾을 수 없습니다.",
-            )
-
-        avg_price = int(avg_price)
-        
-        # 평균 가격의 ±50% 범위 계산
-        min_price = avg_price * 0.5
-        max_price = avg_price * 1.5
-        
-        # 사용자 희망 가격이 범위 내에 있는지 검증
-        is_valid = min_price <= user_price <= max_price
-
         return GetMarketPriceResponse(
-            success=is_valid,
-            avg_price=avg_price,
-            error=None if is_valid else f"희망 가격({user_price:,}원)이 시세 범위({min_price:,.0f}원 ~ {max_price:,.0f}원)를 벗어났습니다.",
+            success=True,
+            avg_price=int(avg_price or 0),
         )
     except Exception as e:
         logger.error(f"get_market_price Error: {e}", exc_info=True)
@@ -444,7 +446,7 @@ async def api_get_user_loan_overview(
                     SELECT annual_salary, DTI, DSR
                     FROM members_info
                     WHERE user_id = :uid
-                    ORDER BY `year_month` DESC
+                    ORDER BY year_month DESC
                     LIMIT 1
                     """
                 ),
@@ -1078,87 +1080,56 @@ async def api_get_investment_ratio(
     "/save_user_portfolio",
     summary="사용자 자산 배분 금액 저장",
     operation_id="save_user_portfolio",
-    response_model=SaveUserPortfolioResponse,
+    response_model=dict,
 )
 async def api_save_user_portfolio(
-    payload: SaveUserPortfolioRequest = Body(...),
-) -> SaveUserPortfolioResponse:
+    payload: Dict[str, Any] = Body(...),
+) -> dict:
     """
-    사용자가 결정한 예금/적금/펀드 배분 비율을 초기 자산 기준으로 금액 계산하여 저장합니다.
-    - income_usage_ratio 형식: "예금:적금:펀드" (예: "30:40:30")
-    - 스키마 기준 컬럼명: deposite_amount, saving_amount, fund_amount
+    사용자가 결정한 예금/적금/펀드 배분 금액을 members 테이블에 저장합니다.
+    - 스키마 기준 컬럼명:
+      deposite_amount, saving_amount, fund_amount
     """
-    user_id = payload.user_id
-    initial_prop_str = payload.initial_prop.strip()
-    income_usage_ratio = payload.income_usage_ratio.strip()
+    user_id = payload.get("user_id")
 
-    # 초기 자산 파싱
-    try:
-        initial_asset = int(initial_prop_str.replace(",", "").replace("원", "").replace("만", "0000"))
-    except ValueError:
-        return SaveUserPortfolioResponse(
-            success=False,
-            error="initial_prop을 숫자로 변환할 수 없습니다.",
-        )
+    deposit = payload.get("deposit_amount")
+    savings = payload.get("savings_amount")
+    fund = payload.get("fund_amount")
 
-    if initial_asset <= 0:
-        return SaveUserPortfolioResponse(
-            success=False,
-            error="초기 자산은 0보다 커야 합니다.",
-        )
+    if not user_id:
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": "user_id는 필수입니다.",
+        }
 
-    # 비율 파싱 (예: "30:40:30" -> [30, 40, 30])
-    try:
-        ratios = income_usage_ratio.split(":")
-        if len(ratios) != 3:
-            return SaveUserPortfolioResponse(
-                success=False,
-                error="income_usage_ratio는 '예금:적금:펀드' 형식이어야 합니다 (예: '30:40:30').",
-            )
-        
-        deposit_ratio = float(ratios[0].strip())
-        savings_ratio = float(ratios[1].strip())
-        fund_ratio = float(ratios[2].strip())
-    except (ValueError, IndexError):
-        return SaveUserPortfolioResponse(
-            success=False,
-            error="비율 형식이 올바르지 않습니다. 숫자로 구성된 '예금:적금:펀드' 형식이어야 합니다.",
-        )
+    if deposit is None or savings is None or fund is None:
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": "deposit_amount, savings_amount, fund_amount 값이 모두 필요합니다.",
+        }
 
-    # 비율 검증
-    total_ratio = deposit_ratio + savings_ratio + fund_ratio
-    if abs(total_ratio - 100) > 0.01:  # 부동소수점 오차 고려
-        return SaveUserPortfolioResponse(
-            success=False,
-            error=f"비율 합계가 100이 아닙니다. (현재: {total_ratio})",
-        )
-
-    if deposit_ratio < 0 or savings_ratio < 0 or fund_ratio < 0:
-        return SaveUserPortfolioResponse(
-            success=False,
-            error="배분 비율은 음수일 수 없습니다.",
-        )
-
-    # 비율을 금액으로 변환 (소수점 이하 버림)
-    deposit_amount = int(initial_asset * deposit_ratio / 100)
-    savings_amount = int(initial_asset * savings_ratio / 100)
-    fund_amount = int(initial_asset * fund_ratio / 100)
+    if deposit < 0 or savings < 0 or fund < 0:
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": "자산 배분 금액은 음수일 수 없습니다.",
+        }
 
     try:
         with engine.begin() as conn:
-            # 사용자 존재 여부 확인
             check_user = conn.execute(
                 text("SELECT 1 FROM members WHERE user_id=:uid"),
                 {"uid": user_id},
             ).scalar()
-            
             if not check_user:
-                return SaveUserPortfolioResponse(
-                    success=False,
-                    error=f"존재하지 않는 사용자 ID({user_id})입니다.",
-                )
+                return {
+                    "tool_name": "save_user_portfolio",
+                    "success": False,
+                    "error": f"존재하지 않는 사용자 ID({user_id})입니다.",
+                }
 
-            # 자산 배분 금액 저장
             conn.execute(
                 text(
                     """
@@ -1167,33 +1138,26 @@ async def api_save_user_portfolio(
                     WHERE user_id=:uid
                 """
                 ),
-                {
-                    "d": deposit_amount,
-                    "s": savings_amount,
-                    "f": fund_amount,
-                    "uid": user_id,
-                },
+                {"d": deposit, "s": savings, "f": fund, "uid": user_id},
             )
 
         logger.info(
-            f"Portfolio saved for User {user_id}: "
-            f"초기자산={initial_asset:,}, "
-            f"예금={deposit_amount:,}({deposit_ratio}%), "
-            f"적금={savings_amount:,}({savings_ratio}%), "
-            f"펀드={fund_amount:,}({fund_ratio}%)"
+            f"Portfolio saved for User {user_id}: D={deposit}, S={savings}, F={fund}"
         )
 
-        return SaveUserPortfolioResponse(
-            success=True,
-            message=f"자산 배분이 정상적으로 저장되었습니다. (예금: {deposit_amount:,}, 적금: {savings_amount:,}, 펀드: {fund_amount:,})",
-        )
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": True,
+            "message": "자산 배분 금액이 정상적으로 저장되었습니다.",
+        }
 
     except Exception as e:
         logger.error(f"save_user_portfolio Error: {e}", exc_info=True)
-        return SaveUserPortfolioResponse(
-            success=False,
-            error=f"DB 저장 실패: {str(e)}",
-        )
+        return {
+            "tool_name": "save_user_portfolio",
+            "success": False,
+            "error": f"DB 저장 실패: {str(e)}",
+        }
 
 
 # ============================================================
@@ -1322,7 +1286,6 @@ async def api_save_selected_savings_products(
                 pname = item.product_name
                 amount = item.amount
                 end_date = item.end_date
-                product_description = item.product_description  # 추가
 
                 if not pname or amount is None:
                     logger.warning(
@@ -1345,11 +1308,11 @@ async def api_save_selected_savings_products(
                         """
                         INSERT INTO my_products
                         (user_id, product_name, product_type,
-                         product_description, current_value,
+                         current_value,
                          end_date, created_at, is_ended)
                         VALUES
                         (:uid, :pname, :ptype,
-                         :pdesc, :current,
+                         :current,
                          :end_date, NOW(), 0)
                         """
                     ),
@@ -1357,7 +1320,6 @@ async def api_save_selected_savings_products(
                         "uid": user_id,
                         "pname": pname,
                         "ptype": "예금",
-                        "pdesc": product_description,  # 추가
                         "current": amount,
                         "end_date": end_date,
                     },
@@ -1369,7 +1331,6 @@ async def api_save_selected_savings_products(
                         "product_id": new_id,
                         "product_name": pname,
                         "product_type": "예금",
-                        "product_description": product_description,  # 추가
                         "amount": amount,
                         "display_id": f"예금_{new_id:04d}",
                     }
@@ -1380,7 +1341,6 @@ async def api_save_selected_savings_products(
                 pname = item.product_name
                 amount = item.amount
                 end_date = item.end_date
-                product_description = item.product_description  # 추가
 
                 if not pname or amount is None:
                     logger.warning(
@@ -1403,11 +1363,11 @@ async def api_save_selected_savings_products(
                         """
                         INSERT INTO my_products
                         (user_id, product_name, product_type,
-                         product_description, current_value,
+                         current_value,
                          end_date, created_at, is_ended)
                         VALUES
                         (:uid, :pname, :ptype,
-                         :pdesc, :current,
+                         :current,
                          :end_date, NOW(), 0)
                         """
                     ),
@@ -1415,7 +1375,6 @@ async def api_save_selected_savings_products(
                         "uid": user_id,
                         "pname": pname,
                         "ptype": "적금",
-                        "pdesc": product_description,  # 추가
                         "current": amount,
                         "end_date": end_date,
                     },
@@ -1427,7 +1386,6 @@ async def api_save_selected_savings_products(
                         "product_id": new_id,
                         "product_name": pname,
                         "product_type": "적금",
-                        "product_description": product_description,  # 추가
                         "amount": amount,
                         "display_id": f"적금_{new_id:04d}",
                     }
@@ -1455,6 +1413,7 @@ async def api_save_selected_savings_products(
             products=[],
             error=str(e),
         )
+
 
 # ============================================================
 # 14. [Fund] 선택 펀드 my_products 일괄 저장
@@ -1494,7 +1453,7 @@ async def save_selected_funds_products(
                 amount = item.amount
                 fund_desc = item.fund_description or ""
                 expected_yield = item.expected_yield
-                end_date = item.end_date
+                end_date = item.end_date  # Optional[str]
 
                 if not fund_name or amount is None:
                     logger.warning(
@@ -1542,10 +1501,8 @@ async def save_selected_funds_products(
                     {
                         "product_id": new_id,
                         "product_name": fund_name,
-                        "product_type": "펀드",
-                        "product_description": fund_desc,  
                         "amount": amount,
-                        "expected_yield": expected_yield,  
+                        "product_type": "펀드",
                         "end_date": end_date,
                     }
                 )
@@ -1565,341 +1522,109 @@ async def save_selected_funds_products(
             saved_products=[],
             error=str(e),
         )
-# ============================================================
-# Summary Agent MCP Tools
-# ============================================================
-# 1. 사용자 프로필 정보 조회
-# 2. 사용자 내투상 정보 조회
+
+
+#### 예금 적금 상품 수정 코드들 ###
 
 # ============================================================
-# 1. 사용자 전체 프로필 조회
+# 14. [FAISS] 전체 예금 상품 조회
 # ============================================================
 @router.post(
-    "/get_user_full_profile",
-    summary="Plan 보고서용 사용자 전체 프로필 조회",
-    operation_id="get_user_full_profile",
-    response_model=GetUserFullProfileResponse,
+    "/get_all_deposit_products",
+    summary="전체 예금 상품 조회",
+    operation_id="get_all_deposit_products",
+    response_model=GetAllDepositProductsResponse,
 )
-async def api_get_user_full_profile(
-    payload: GetUserFullProfileRequest = Body(...),
-) -> GetUserFullProfileResponse:
+async def api_get_all_deposit_products(
+    payload: GetAllDepositProductsRequest = Body(...),
+) -> GetAllDepositProductsResponse:
     """
-    Plan 보고서 생성에 필요한 사용자 기본 정보를 한번에 조회하는 Tool.
+    FAISS 인덱스에 저장된 모든 예금 상품 데이터를 반환합니다.
     
-    Members 테이블:
-    - name, hope_location, hope_price, hope_housing_type
-    - deposite_amount, saving_amount, fund_amount
-    - shortage_amount, initial_prop, income_usage_ratio
-    
-    Members_info 테이블 (가장 오래된 year_month 기준):
-    - monthly_salary, annual_salary
+    - 필터링 없음: 전체 8개 예금 상품 정보를 모두 반환
+    - 상품 정보: 상품명, 상품종류, 개요, 특징, 가입대상, 가입금액, 가입기간, 기본금리 등
+    - LLM이 이 데이터를 받아서 추가 분석/추천에 활용
     """
-    user_id = payload.user_id
-
-    if not user_id:
-        return GetUserFullProfileResponse(
-            success=False,
-            user_id=None,
-            error="user_id는 필수입니다.",
-        )
-
     try:
-        with engine.connect() as conn:
-            # 1) Members 테이블에서 기본 정보 조회
-            members_query = text(
-                """
-                SELECT 
-                    name,
-                    hope_location,
-                    hope_price,
-                    hope_housing_type,
-                    deposite_amount,
-                    saving_amount,
-                    fund_amount,
-                    shortage_amount,
-                    initial_prop,
-                    income_usage_ratio
-                FROM members
-                WHERE user_id = :uid
-                LIMIT 1
-                """
-            )
-            members_row = conn.execute(members_query, {"uid": user_id}).fetchone()
-
-            if not members_row:
-                return GetUserFullProfileResponse(
-                    success=False,
-                    user_id=user_id,
-                    error=f"user_id={user_id}에 해당하는 사용자를 찾을 수 없습니다.",
-                )
-
-            # 2) Members_info 테이블에서 가장 오래된 데이터 조회
-            members_info_query = text(
-                """
-                SELECT 
-                    monthly_salary,
-                    annual_salary
-                FROM members_info
-                WHERE user_id = :uid
-                ORDER BY year_month ASC
-                LIMIT 1
-                """
-            )
-            members_info_row = conn.execute(members_info_query, {"uid": user_id}).fetchone()
-
-            # Members 데이터 언패킹
-            (
-                name,
-                hope_location,
-                hope_price,
-                hope_housing_type,
-                deposite_amount,
-                saving_amount,
-                fund_amount,
-                shortage_amount,
-                initial_prop,
-                income_usage_ratio,
-            ) = members_row
-
-            # Members_info 데이터 (없을 수 있음)
-            monthly_salary = None
-            annual_salary = None
-            if members_info_row:
-                monthly_salary, annual_salary = members_info_row
-
-        logger.info(
-            f"✅ get_user_full_profile 완료 — user_id={user_id}, name={name}"
-        )
-
-        return GetUserFullProfileResponse(
-            success=True,
-            user_id=user_id,
-            # Members 정보
-            name=name,
-            hope_location=hope_location,
-            hope_price=hope_price,
-            hope_housing_type=hope_housing_type,
-            deposite_amount=deposite_amount if deposite_amount else 0,
-            saving_amount=saving_amount if saving_amount else 0,
-            fund_amount=fund_amount if fund_amount else 0,
-            shortage_amount=shortage_amount if shortage_amount else 0,
-            initial_prop=initial_prop if initial_prop else 0,
-            income_usage_ratio=income_usage_ratio if income_usage_ratio else 0,
-            # Members_info 정보
-            monthly_salary=monthly_salary if monthly_salary else 0,
-            annual_salary=annual_salary if annual_salary else 0,
-            error=None,
-        )
-
-    except Exception as e:
-        logger.error(f"get_user_full_profile Error: {e}", exc_info=True)
-        return GetUserFullProfileResponse(
-            success=False,
-            user_id=user_id,
-            error=f"DB 조회 중 오류 발생: {str(e)}",
-        )
+        # 메타데이터 로드 (전체 상품 정보)
+        metadata = _load_deposit_faiss_data()
         
+        # 모든 상품 정보 반환
+        products = [product.copy() for product in metadata]
+        
+        logger.info(f"✅ 전체 예금 상품 조회 완료: {len(products)}개")
+        
+        return GetAllDepositProductsResponse(
+            success=True,
+            products=products,
+            total_count=len(products),
+        )
+    
+    except FileNotFoundError as e:
+        logger.error(f"예금 메타데이터 파일 오류: {e}")
+        return GetAllDepositProductsResponse(
+            success=False,
+            products=[],
+            total_count=0,
+            error=f"예금 상품 데이터를 찾을 수 없습니다: {str(e)}",
+        )
+    except Exception as e:
+        logger.error(f"get_all_deposit_products Error: {e}", exc_info=True)
+        return GetAllDepositProductsResponse(
+            success=False,
+            products=[],
+            total_count=0,
+            error=f"예금 상품 조회 중 오류 발생: {str(e)}",
+        )
+
+
 # ============================================================
-# 2. 사용자 선택 예금/적금/펀드 상품 조회
+# 15. [FAISS] 전체 적금 상품 조회
 # ============================================================
 @router.post(
-    "/get_user_products_info",
-    summary="사용자가 선택한 예금/적금/펀드 상품 조회",
-    operation_id="get_user_products_info",
-    response_model=GetUserProductsResponse,
+    "/get_all_saving_products",
+    summary="전체 적금 상품 조회",
+    operation_id="get_all_saving_products",
+    response_model=GetAllSavingProductsResponse,
 )
-async def api_get_user_products(
-    payload: GetUserProductsRequest = Body(...),
-) -> GetUserProductsResponse:
+async def api_get_all_saving_products(
+    payload: GetAllSavingProductsRequest = Body(...),
+) -> GetAllSavingProductsResponse:
     """
-    my_products 테이블에서 사용자가 선택한 예금/적금/펀드 상품 정보를 조회하는 Tool.
+    FAISS 인덱스에 저장된 모든 적금 상품 데이터를 반환합니다.
     
-    조회 컬럼:
-    - product_name: 상품명
-    - product_type: 상품 유형 (예금, 적금, 펀드)
-    - current_value: 저축/투자 금액
-    - product_description: 상품 간략 설명
+    - 필터링 없음: 전체 19개 적금 상품 정보를 모두 반환
+    - 상품 정보: 상품명, 상품종류, 개요, 특징, 가입대상, 적립금액, 가입기간, 기본금리, 우대금리 등
+    - LLM이 이 데이터를 받아서 추가 분석/추천에 활용
     """
-    user_id = payload.user_id
-
-    if not user_id:
-        return GetUserProductsResponse(
-            success=False,
-            user_id=None,
-            error="user_id는 필수입니다.",
-        )
-
     try:
-        with engine.connect() as conn:
-            query = text(
-                """
-                SELECT 
-                    product_name,
-                    product_type,
-                    current_value,
-                    product_description
-                FROM my_products
-                WHERE user_id = :uid
-                  AND product_type IN ('예금', '적금', '펀드')
-                  AND is_ended = 0
-                ORDER BY product_type, created_at DESC
-                """
-            )
-            rows = conn.execute(query, {"uid": user_id}).fetchall()
-
-            deposit_products = []
-            savings_products = []
-            fund_products = []
-            
-            total_deposit_amount = 0
-            total_savings_amount = 0
-            total_fund_amount = 0
-
-            for row in rows:
-                product_name, product_type, current_value, product_description = row
-                
-                item = {
-                    "product_name": product_name,
-                    "product_type": product_type,
-                    "current_value": current_value if current_value else 0,
-                    "product_description": product_description,
-                }
-
-                if product_type == "예금":
-                    deposit_products.append(item)
-                    total_deposit_amount += current_value if current_value else 0
-                elif product_type == "적금":
-                    savings_products.append(item)
-                    total_savings_amount += current_value if current_value else 0
-                elif product_type == "펀드":
-                    fund_products.append(item)
-                    total_fund_amount += current_value if current_value else 0
-
-        logger.info(
-            f"✅ get_user_products 완료 — user_id={user_id}, "
-            f"예금={len(deposit_products)}건, 적금={len(savings_products)}건, 펀드={len(fund_products)}건"
-        )
-
-        return GetUserProductsResponse(
+        # 메타데이터 로드 (전체 상품 정보)
+        metadata = _load_saving_faiss_data()
+        
+        # 모든 상품 정보 반환
+        products = [product.copy() for product in metadata]
+        
+        logger.info(f"✅ 전체 적금 상품 조회 완료: {len(products)}개")
+        
+        return GetAllSavingProductsResponse(
             success=True,
-            user_id=user_id,
-            deposit_products=deposit_products,
-            savings_products=savings_products,
-            fund_products=fund_products,
-            total_deposit_count=len(deposit_products),
-            total_savings_count=len(savings_products),
-            total_fund_count=len(fund_products),
-            total_deposit_amount=total_deposit_amount,
-            total_savings_amount=total_savings_amount,
-            total_fund_amount=total_fund_amount,
-            error=None,
+            products=products,
+            total_count=len(products),
         )
-
-    except Exception as e:
-        logger.error(f"get_user_products Error: {e}", exc_info=True)
-        return GetUserProductsResponse(
-            success=False,
-            user_id=user_id,
-            error=f"DB 조회 중 오류 발생: {str(e)}",
-        )
-# ============================================================
-# 3. Plan 보고서용 대출 정보 조회
-# ============================================================
-@router.post(
-    "/get_user_loan_info",
-    summary="Plan 보고서용 대출 정보 조회",
-    operation_id="get_user_loan_info",
-    response_model=GetUserLoanInfoResponse,
-)
-async def api_get_user_loan_info(
-    payload: GetUserLoanInfoRequest = Body(...),
-) -> GetUserLoanInfoResponse:
-    """
-    Plan 보고서 생성에 필요한 대출 정보를 조회하는 Tool.
     
-    Plans 테이블:
-    - loan_amount: 대출 가능 금액
-    
-    loan_product 테이블:
-    - product_name, bank_name, summary
-    - rate_description, limit_description, period_description
-    - rayment_method, preferential_rate_info
-    """
-    user_id = payload.user_id
-
-    if not user_id:
-        return GetUserLoanInfoResponse(
+    except FileNotFoundError as e:
+        logger.error(f"적금 메타데이터 파일 오류: {e}")
+        return GetAllSavingProductsResponse(
             success=False,
-            user_id=None,
-            error="user_id는 필수입니다.",
+            products=[],
+            total_count=0,
+            error=f"적금 상품 데이터를 찾을 수 없습니다: {str(e)}",
         )
-
-    try:
-        with engine.connect() as conn:
-            query = text(
-                """
-                SELECT 
-                    p.loan_amount,
-                    l.product_name,
-                    l.bank_name,
-                    l.summary,
-                    l.rate_description,
-                    l.limit_description,
-                    l.period_description,
-                    l.rayment_method,
-                    l.preferential_rate_info
-                FROM plans p
-                LEFT JOIN loan_product l ON p.product_id = l.loan_product_id
-                WHERE p.user_id = :uid
-                ORDER BY p.plan_id DESC
-                LIMIT 1
-                """
-            )
-            row = conn.execute(query, {"uid": user_id}).fetchone()
-
-            if not row:
-                return GetUserLoanInfoResponse(
-                    success=False,
-                    user_id=user_id,
-                    error=f"user_id={user_id}에 해당하는 플랜 정보를 찾을 수 없습니다.",
-                )
-
-            (
-                loan_amount,
-                product_name,
-                bank_name,
-                summary,
-                rate_description,
-                limit_description,
-                period_description,
-                repayment_method,
-                preferential_rate_info,
-            ) = row
-
-        logger.info(
-            f"✅ get_user_loan_info 완료 — user_id={user_id}, "
-            f"loan_amount={loan_amount}, product={product_name}"
-        )
-
-        return GetUserLoanInfoResponse(
-            success=True,
-            user_id=user_id,
-            loan_amount=loan_amount if loan_amount else 0,
-            product_name=product_name,
-            bank_name=bank_name,
-            summary=summary,
-            rate_description=rate_description,
-            limit_description=limit_description,
-            period_description=period_description,
-            repayment_method=repayment_method,
-            preferential_rate_info=preferential_rate_info,
-            error=None,
-        )
-
     except Exception as e:
-        logger.error(f"get_user_loan_info Error: {e}", exc_info=True)
-        return GetUserLoanInfoResponse(
+        logger.error(f"get_all_saving_products Error: {e}", exc_info=True)
+        return GetAllSavingProductsResponse(
             success=False,
-            user_id=user_id,
-            error=f"DB 조회 중 오류 발생: {str(e)}",
+            products=[],
+            total_count=0,
+            error=f"적금 상품 조회 중 오류 발생: {str(e)}",
         )

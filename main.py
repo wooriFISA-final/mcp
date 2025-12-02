@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from config.logger import get_logger
@@ -5,7 +6,7 @@ from server.mcp_server import (
     all_app,
     mcp_app)
 
-
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 logger = get_logger()
 
 def create_app() -> FastAPI:
