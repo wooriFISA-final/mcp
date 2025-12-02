@@ -44,6 +44,9 @@ class ReportRead(BaseModel):
     policy_changes: str | None = None
     net_profit: float | None = None
     profit_rate: float | None = None
+    # 🆕 투자 그래프 데이터 필드 추가
+    trend_chart_json: str | None = None
+    fund_comparison_json: str | None = None
 
     class Config:
         from_attributes = True

@@ -14,7 +14,10 @@ from pathlib import Path
 from langchain_huggingface import HuggingFaceEndpointEmbeddings 
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from sqlalchemy import create_engine, text
+from decimal import Decimal
 
 
 # ------------------------------------------------------------------
@@ -65,7 +68,51 @@ POLICY_DIR = "./data/policy_documents"
 router = APIRouter(
     prefix="/report_processing",
     tags=["Report Processing Tools"] 
+    
 )
+
+# ------------------------------------------------------------------
+# 🎯 [DB 연결 설정] Agent Tools에서 직접 DB 조회
+# ------------------------------------------------------------------
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+
+engine = None
+if DB_USER and DB_PASSWORD and DB_HOST and DB_NAME:
+    try:
+        engine = create_engine(f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}")
+        logger.info("✅ Report Agent Tools DB Engine 생성 완료")
+    except Exception as e:
+        logger.error(f"❌ DB Engine 생성 실패: {e}")
+
+def _execute_query(query: str, params: Dict[str, Any], fetch_many: bool = False) -> List[Dict[str, Any]] | Dict[str, Any] | None:
+    """DB 쿼리를 안전하게 실행하는 내부 유틸리티."""
+    if engine is None: 
+        logger.warning("DB Engine이 연결되지 않았습니다.")
+        return None if not fetch_many else []
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text(query), params).mappings().all()
+            
+            processed_results = []
+            for row in result:
+                processed_row = dict(row)
+                for key, value in processed_row.items():
+                    if isinstance(value, (date, datetime)):
+                        processed_row[key] = value.strftime("%Y-%m-%d")
+                    elif isinstance(value, Decimal):
+                        processed_row[key] = float(value) 
+                processed_results.append(processed_row)
+            
+            if fetch_many: 
+                return processed_results
+            else: 
+                return processed_results[0] if processed_results else None
+    except Exception as e:
+        logger.error(f"DB 쿼리 실행 오류: {e}", exc_info=True)
+        return None if not fetch_many else []
 
 # ------------------------------------------------------------------
 # 🎯 [새로운 상수 정의] 정책 파일과 적용 월의 규칙 매핑 (YYYYMMDD_policy.pdf)
@@ -517,7 +564,11 @@ async def api_check_policy_changes(
     
     if not LATEST_POLICY_SOURCE:
         # 정책 파일이 없으면 변동 없음으로 간주
-        report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date().strftime('%Y년 %m월')
+        # 🔧 수정: "YYYY-MM" 또는 "YYYY-MM-DD" 형식 모두 지원
+        if len(report_month_str) == 7:  # "YYYY-MM" 형식
+            report_month = datetime.strptime(report_month_str + "-01", "%Y-%m-%d").date().strftime('%Y년 %m월')
+        else:  # "YYYY-MM-DD" 형식
+            report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date().strftime('%Y년 %m월')
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
             "success": True, 
@@ -530,14 +581,18 @@ async def api_check_policy_changes(
     
     # 1. 📅 날짜 체크 및 초기 설정
     try:
-        report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date()
+        # 🔧 수정: "YYYY-MM" 또는 "YYYY-MM-DD" 형식 모두 지원
+        if len(report_month_str) == 7:  # "YYYY-MM" 형식
+            report_month = datetime.strptime(report_month_str + "-01", "%Y-%m-%d").date()
+        else:  # "YYYY-MM-DD" 형식
+            report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date()
         
         # 최신 정책 파일 날짜 추출
         file_name = Path(LATEST_POLICY_SOURCE).name 
         latest_policy_date_str = file_name.split('_')[0] # 'YYYYMMDD' 추출
         latest_policy_date = datetime.strptime(latest_policy_date_str, "%Y%m%d").date()
         
-    except ValueError:
+    except ValueError as e:
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
             "success": False, 
@@ -611,37 +666,98 @@ async def api_check_policy_changes(
 # ==============================================================================
 @router.post(
     "/analyze_investment_profit",
-    summary="투자 상품 손익/진척도 분석",
+    summary="투자 상품 손익/진척도 분석 + 그래프 데이터 생성",
     operation_id="analyze_investment_profit_tool", 
-    description="예금, 적금, 펀드의 수익률과 진척도를 분석하고 LLM을 통해 조언을 생성합니다.",
+    description="예금, 적금, 펀드의 수익률과 진척도를 분석하고 그래프 데이터를 생성합니다.",
     response_model=dict,
 )
-async def api_analyze_investment_profit(products: List[Dict[str, Any]] = Body(..., embed=True)) -> dict:
-    """보유 상품 목록을 기반으로 손익 데이터를 계산합니다. (LLM 호출 제거 - Agent가 처리)"""
+async def api_analyze_investment_profit(
+    user_id: int = Body(..., embed=True),
+    # products, monthly_data, fund_portfolio_data are now fetched internally
+) -> dict:
+    """
+    보유 상품 목록과 월별 시뮬레이션 데이터를 DB에서 직접 조회하여 손익 데이터 및 그래프 데이터를 계산합니다.
+    """
     
-    if not products:
-        return {
-            "tool_name": "analyze_investment_profit_tool", 
-            "success": True, 
-            "total_principal": 0,
-            "total_valuation": 0,
-            "net_profit": 0,
-            "profit_rate": 0.0,
-            "products_count": 0,
-            "message": "현재 보유 중인 투자 상품이 없어 분석을 건너킵니다."
-        }
+    # 1. DB에서 데이터 조회
+    # (1) 보유 상품 목록 (my_products)
+    products_query = "SELECT * FROM my_products WHERE user_id = :uid"
+    products = _execute_query(products_query, {"uid": user_id}, fetch_many=True) or []
 
+    # (2) 월별 시뮬레이션 데이터 (monthly_simulation_report) - 최근 12개월
+    monthly_query = """
+        SELECT * FROM monthly_simulation_report 
+        WHERE user_id = :uid 
+        ORDER BY year_and_month ASC
+        LIMIT 12
+    """
+    monthly_data = _execute_query(monthly_query, {"uid": user_id}, fetch_many=True) or []
+
+    # (3) 펀드 포트폴리오 스냅샷 (monthly_fund_portfolio_snapshot) - 최신 월
+    latest_month_query = "SELECT MAX(year_and_month) as max_month FROM monthly_fund_portfolio_snapshot WHERE user_id = :uid"
+    latest_month_result = _execute_query(latest_month_query, {"uid": user_id}, fetch_many=False)
+    
+    fund_portfolio_data = []
+    if latest_month_result and latest_month_result.get("max_month"):
+        target_month = latest_month_result["max_month"]
+        fund_query = """
+            SELECT * FROM monthly_fund_portfolio_snapshot 
+            WHERE user_id = :uid AND year_and_month = :month
+        """
+        fund_portfolio_data = _execute_query(fund_query, {"uid": user_id, "month": target_month}, fetch_many=True) or []
+    
     total_principal = 0
     total_valuation = 0
     
-    for p in products:
-        principal = p.get('total_principal', 0) or 0
-        valuation = p.get('current_valuation', 0) or 0
-        total_principal += principal
-        total_valuation += valuation 
+    # 1. 현재 보유 상품 손익 계산 (my_product 테이블 기준)
+    if products:
+        for p in products:
+            # payment_amount: 투자 원금, current_value: 현재 평가액
+            principal = p.get('payment_amount', 0) or 0
+            valuation = p.get('current_value', 0) or 0
+            
+            # 문자열일 경우 float 변환
+            if isinstance(principal, str): principal = float(principal)
+            if isinstance(valuation, str): valuation = float(valuation)
+            
+            total_principal += principal
+            total_valuation += valuation
 
     net_profit = total_valuation - total_principal
     profit_rate = (net_profit / total_principal) * 100 if total_principal else 0
+    
+    # 2. 그래프 1: 월별 수익률 추이 (monthly_simulation_report 기반)
+    trend_chart_data = []
+    if monthly_data:
+        for record in monthly_data:
+            # total_return_rate는 0.05 처럼 소수점으로 저장됨 -> 100 곱해서 %로 변환
+            fund_rate = float(record.get("total_return_rate", 0) or 0) * 100
+            
+            trend_chart_data.append({
+                "month": record.get("year_and_month", ""),
+                "deposit_rate": float(record.get("deposit_rate", 0) or 0),
+                "savings_rate": float(record.get("savings_rate", 0) or 0),
+                "fund_rate": round(fund_rate, 2)
+            })
+    
+    trend_chart_json = json.dumps(trend_chart_data, ensure_ascii=False)
+    
+    # 3. 그래프 2: 펀드 상품별 손익 (monthly_fund_portfolio_snapshot 기반)
+    fund_comparison_data = []
+    if fund_portfolio_data:
+        for fund in fund_portfolio_data:
+            invested = float(fund.get('invested_amount', 0) or 0)
+            eval_amt = float(fund.get('eval_amount', 0) or 0)
+            profit = eval_amt - invested
+            
+            fund_comparison_data.append({
+                "name": fund.get('fund_product_name', '알 수 없음'),
+                "principal": int(invested),
+                "valuation": int(eval_amt),
+                "profit": int(profit)
+            })
+            
+    fund_comparison_json = json.dumps(fund_comparison_data, ensure_ascii=False)
     
     return {
         "tool_name": "analyze_investment_profit_tool", 
@@ -650,9 +766,10 @@ async def api_analyze_investment_profit(products: List[Dict[str, Any]] = Body(..
         "total_valuation": int(total_valuation),
         "net_profit": int(net_profit),
         "profit_rate": round(profit_rate, 2),
-        "products_count": len(products)
+        "products_count": len(products) if products else 0,
+        "trend_chart_json": trend_chart_json,
+        "fund_comparison_json": fund_comparison_json
     }
-
 
 
 # ==============================================================================
