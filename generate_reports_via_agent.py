@@ -59,8 +59,8 @@ async def main():
     """
     2023-12부터 2025-09까지 순차적으로 리포트 생성
     """
-    start_date = datetime(2024, 6, 1)
-    end_date = datetime(2024, 6, 1)
+    start_date = datetime(2025, 10, 1)
+    end_date = datetime(2025, 10, 1)
     
     print("="*80)
     print("🚀 Agent 기반 과거 리포트 생성 시작")
