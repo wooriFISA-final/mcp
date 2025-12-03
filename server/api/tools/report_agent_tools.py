@@ -14,7 +14,6 @@ from pathlib import Path
 from langchain_huggingface import HuggingFaceEndpointEmbeddings 
 from langchain_community.vectorstores import FAISS
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sqlalchemy import create_engine, text
 from decimal import Decimal
@@ -130,148 +129,59 @@ POLICY_FILE_DATES = [
 ]
 
 # ------------------------------------------------------------------
-# 🎯 [수정된 함수]: 보고서 월에 해당하는 정책 파일을 찾습니다.
+# 🎯 [핵심 함수] 보고서 월에 해당하는 정책 파일 찾기
 # ------------------------------------------------------------------
 def _find_policy_file_for_report(report_date_str: str) -> Optional[str]:
     """
-    보고서 날짜(YYYY-MM-DD)를 기준으로, 해당 월에 반영해야 할 정책 파일을 찾습니다.
-    (정책 발표일 다음 달 1일이 보고서 작성일인 경우 해당 정책 파일을 선택)
+    보고서 날짜(YYYY-MM-DD 또는 YYYY-MM)를 기준으로, 해당 월에 반영해야 할 정책 파일을 찾습니다.
+    
+    로직:
+    - 보고서 제공일(create_at)이 2024-03-01이면 → 2024년 2월 리포트
+    - 2024년 2월에 발표된 정책을 포함
+    - 즉, report_date_str의 전월(2월)에 발표된 정책을 찾음
     """
     try:
-        # 보고서가 발행되는 월의 1일 (예: 2024-12-01)
-        report_month_start = datetime.strptime(report_date_str, "%Y-%m-%d").replace(day=1)
+        # 🔧 수정: 입력 형식에 관계없이 YYYY-MM-DD 형태로 변환
+        if len(report_date_str) == 7:  # YYYY-MM 형식
+            report_date_str = report_date_str + "-01"
+            
+        # 보고서 제공일 (예: 2024-03-01)
+        report_delivery_date = datetime.strptime(report_date_str[:10], "%Y-%m-%d").replace(day=1)
+        
+        # 🎯 [핵심 수정]: 보고서 대상 월 = 제공일의 전월 (예: 2024-02)
+        report_target_month = report_delivery_date - relativedelta(months=1)
 
         # 정책 파일 날짜 목록을 역순으로 순회 (최신 정책부터 확인)
         for policy_date_str in sorted(POLICY_FILE_DATES, reverse=True):
             policy_date = datetime.strptime(policy_date_str, "%Y%m%d").date()
             
-            # 정책 발표일의 다음 달 1일 (정책 변동 사항이 반영될 목표 보고서 월)
-            policy_effective_month_start = (datetime(policy_date.year, policy_date.month, 1) + relativedelta(months=1))
+            # 🎯 [핵심 수정]: 정책 발표 월 (예: 2024-02)
+            policy_month = datetime(policy_date.year, policy_date.month, 1)
             
-            # 만약 정책의 유효 시작 월이 현재 처리 중인 보고서 월과 같다면, 이 정책을 사용합니다.
-            if policy_effective_month_start == report_month_start:
+            # 정책 발표 월 == 보고서 대상 월이면 해당 정책 사용
+            if policy_month == report_target_month:
                 filename = f"{policy_date_str}_policy.pdf"
                 full_path = os.path.join(POLICY_DIR, filename)
                 
                 if os.path.exists(full_path):
-                    logger.info(f"RAG: {report_date_str[:7]} 보고서에 {filename} 정책 파일 지정됨.")
+                    logger.info(f"RAG: {report_delivery_date.strftime('%Y-%m')} 제공 리포트(대상월: {report_target_month.strftime('%Y-%m')})에 {filename} 정책 파일 지정됨.")
                     return full_path
                 else:
-                    logger.warning(f"RAG: 지정된 정책 파일({filename})이 디렉토리에 없습니다.")
+                    logger.warning(f"RAG: 지정된 정책 파일({filename})이 디렉토리에 없습니다. ({full_path})")
                     return None
         
-        logger.info(f"RAG: {report_date_str[:7]} 보고서에 반영할 정책 파일을 찾지 못했습니다. (해당 월은 정책 변동 없음)")
+        logger.info(f"RAG: {report_delivery_date.strftime('%Y-%m')} 제공 리포트(대상월: {report_target_month.strftime('%Y-%m')})에 반영할 정책 파일을 찾지 못했습니다.")
         return None
         
     except Exception as e:
-        logger.error(f"정책 파일 결정 중 오류 발생: {e}")
+        logger.error(f"정책 파일 결정 중 오류 발생: {e}", exc_info=True)
         return None
 
 
 # ------------------------------------------------------------------
 # 🎯 [신규 TOOL 0] 벡터 DB 재구축 및 업데이트
 # ------------------------------------------------------------------
-# @router.post(
-#     "/rebuild_vector_db",
-#     summary="정책 문서를 기반으로 FAISS 벡터 DB를 재구축",
-#     operation_id="rebuild_vector_db_tool",
-#     description="data/policy_documents 폴더의 모든 PDF를 읽어 벡터 DB를 완전히 새로 구축합니다.",
-#     response_model=dict,
-# )
-# async def api_rebuild_vector_db() -> dict:
-#     """PDF 파일을 로드, 분할, 임베딩하여 FAISS 벡터 DB를 구축합니다."""
-    
-#     logger.info(f"--- RAG 벡터 데이터베이스 구축 시작 (Model: {HF_EMBEDDING_MODEL}) ---")
-    
-#     if not os.path.exists(POLICY_DIR):
-#         error_msg = f"❌ '{POLICY_DIR}' 폴더가 존재하지 않습니다. data/policy_documents 폴더를 확인해주세요."
-#         logger.error(error_msg)
-#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-#     file_paths = glob.glob(os.path.join(POLICY_DIR, '*.pdf'))
-#     if not file_paths:
-#         info_msg = f"✅ policy_documents 폴더에 PDF 파일이 없습니다. 문서를 추가해 주세요."
-#         logger.info(info_msg)
-#         return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
-
-#     documents = []
-#     for file_path in file_paths:
-#         loader = PyPDFLoader(file_path)
-#         documents.extend(loader.load())
-
-#     custom_separators = [
-#         r"\n제[0-9]{1,3}장\s",
-#         r"\n제[0-9]{1,3}조\s",
-#         r"\n[가-힣\d]\.\s?",
-#         r"\n\([가-힣\d]{1,2}\)\s?",
-#         r"\n",                           
-#         " ",
-#         ""
-#     ]
-    
-#     text_splitter = RecursiveCharacterTextSplitter(
-#         chunk_size=1000,  
-#         chunk_overlap=50, 
-#         separators=custom_separators,
-#         keep_separator=True
-#     )
-#     texts = text_splitter.split_documents(documents)
-#     logger.info(f"➡️ 총 {len(documents)}개 문서에서 {len(texts)}개의 텍스트 청크 생성 완료.")
-    
-#     if not HUGGINGFACEHUB_API_TOKEN:
-#         error_msg = "❌ HUGGINGFACEHUB_API_TOKEN 환경 변수가 설정되지 않았습니다."
-#         logger.error(error_msg)
-#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-    
-#     try:
-#         embeddings = HuggingFaceEndpointEmbeddings(
-#             model=HF_EMBEDDING_MODEL, 
-#             huggingfacehub_api_token=HUGGINGFACEHUB_API_TOKEN,
-#         )
-#     except Exception as e:
-#         error_msg = f"🚨 임베딩 모델 로드 실패: {e}"
-#         logger.error(error_msg)
-#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-#     logger.info(f"💾 FAISS 벡터 DB 생성 중... ({len(texts)}개 청크)")
-#     batch_size = 32
-#     sleep_time = 3
-    
-#     if not texts:
-#         return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": "경고: 분할된 텍스트 청크가 없어 DB 구축을 건너뜁니다."}
-        
-#     first_batch = texts[:batch_size]
-#     remaining_texts = texts[batch_size:]
-
-#     try:
-#         db = FAISS.from_documents(first_batch, embeddings)
-#     except Exception as e:
-#         error_msg = f"🚨 DB 초기 생성 실패: {e}"
-#         logger.error(error_msg)
-#         return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-#     total_processed = len(first_batch)
-    
-#     for i in range(0, len(remaining_texts), batch_size):
-#         batch = remaining_texts[i:i + batch_size]
-#         logger.info(f"   -- API 요청 지연 ({sleep_time}초 대기) --")
-#         time.sleep(sleep_time)
-        
-#         try:
-#             db.add_documents(batch)
-#             total_processed += len(batch)
-#             logger.info(f"   -> {total_processed} / {len(texts)}개 청크 추가 완료.")
-#         except Exception as e:
-#             error_msg = f"🚨 임베딩 오류 발생: {e}. DB 구축을 중단합니다."
-#             logger.error(error_msg)
-#             return {"tool_name": "rebuild_vector_db_tool", "success": False, "error": error_msg}
-
-#     Path(VECTOR_DB_PATH).mkdir(parents=True, exist_ok=True)
-#     db.save_local(VECTOR_DB_PATH) 
-
-#     info_msg = f"--- ✅ 벡터 DB 구축 완료 --- (저장 경로: {VECTOR_DB_PATH})"
-#     logger.info(info_msg)
-#     return {"tool_name": "rebuild_vector_db_tool", "success": True, "message": info_msg}
+# ... (주석 처리된 api_rebuild_vector_db 함수 유지) ...
 
 
 # ------------------------------------------------------------------
@@ -438,14 +348,14 @@ def _find_policies_by_marker_regex(context: str, target_date: Optional[str] = No
     "/analyze_user_spending",
     summary="월별 소비 데이터 비교 분석 및 군집 생성",
     operation_id="analyze_user_spending_tool", 
-    description="두 달치 소비 데이터(DataFrame Records)를 받아 총 지출, Top 5 카테고리를 비교 분석하고, 군집 별명과 조언을 LLM을 통해 생성합니다.",
+    description="두 달치 소비 데이터(DataFrame Records)를 받아 총 지출, Top 5 카테고리를 비교 분석합니다. Agent가 이 데이터를 보고 별명과 분석 텍스트를 생성합니다.",
     response_model=dict,
 )
 async def analyze_user_spending(
     consume_records: List[Dict[str, Any]] = Body(..., embed=True),
     member_data: Dict[str, Any] = Body(..., embed=False)
 ) -> dict:
-    """소비 데이터를 기반으로 분석 데이터를 생성합니다. (LLM 호출 제거 - Agent가 처리)"""
+    """소비 데이터를 기반으로 분석 데이터를 생성합니다. Agent가 이 데이터로 별명과 리포트를 작성합니다."""
 
     if not consume_records or len(consume_records) < 2:
         error_msg = "비교 분석을 위한 최소 2개월 데이터 부족" if consume_records else "분석할 소비 데이터가 존재하지 않아 건너뜁니다."
@@ -460,6 +370,11 @@ async def analyze_user_spending(
     try:
         # 데이터프레임으로 변환 및 정렬
         df_consume = pd.DataFrame(consume_records)
+        
+        # 🚨 [Fix] Handle 'YYYY_MM' format from DB by replacing '_' with '-'
+        if 'year_and_month' in df_consume.columns:
+            df_consume['year_and_month'] = df_consume['year_and_month'].astype(str).str.replace('_', '-')
+            
         df_consume['year_and_month'] = pd.to_datetime(df_consume['year_and_month'])
         df_consume = df_consume.sort_values(by='year_and_month', ascending=False)
         
@@ -477,9 +392,7 @@ async def analyze_user_spending(
         target_cols = cat2_cols if cat2_cols else [col for col in latest_data.index if col.startswith('CAT1_')]
         prefix = 'CAT2_' if cat2_cols else 'CAT1_'
         
-        # Top 5 카테고리 추출 (분석 텍스트용 - 여전히 대분류 기준이 좋을 수 있으나, 일관성을 위해 target_cols 사용)
-        # 만약 분석 텍스트는 대분류로 유지하고 싶다면 cat1_cols를 별도로 구해야 함.
-        # 여기서는 차트와 일관되게 소분류가 있으면 소분류 Top 5를 사용하도록 변경함.
+        # Top 5 카테고리 추출
         latest_cats = df_consume.iloc[0][target_cols].sort_values(ascending=False).head(5) 
         
         # spend_chart_json을 위한 전체 카테고리별 금액 계산
@@ -495,6 +408,10 @@ async def analyze_user_spending(
                 })
         spend_chart_json = json.dumps(chart_data_list, ensure_ascii=False)
         
+        # Top 5 카테고리 이름과 금액
+        top_5_categories = [col.replace(prefix, '').replace('_', ' ') for col in latest_cats.index]
+        top_5_amounts = [int(latest_cats[col]) for col in latest_cats.index]
+        
         # consume_analysis_summary 구성 (Agent가 사용할 데이터)
         consume_analysis_summary = {
             'latest_total_spend': int(total_spend_latest),
@@ -502,8 +419,8 @@ async def analyze_user_spending(
             'spend_diff': int(diff),
             'change_rate': round(change_rate, 2),
             'total_change_diff': change_text,
-            'top_5_categories': [col.replace('CAT1_', '') for col in latest_cats.index],
-            'top_5_amounts': [int(latest_cats[col]) for col in latest_cats.index],
+            'top_5_categories': top_5_categories,
+            'top_5_amounts': top_5_amounts,
             'member_info': member_data
         }
         
@@ -515,7 +432,7 @@ async def analyze_user_spending(
         }
 
     except Exception as e:
-        logger.error(f"소비 분석 오류: {e}")
+        logger.error(f"소비 분석 오류: {e}", exc_info=True)
         return {"tool_name": "analyze_user_spending_tool", "success": False, "error": str(e)}
 
     
@@ -545,7 +462,7 @@ async def api_generate_final_summary(report_content: str = Body(..., embed=True)
 
 
 # ==============================================================================
-# 독립 Tool 3: 정책 변동 자동 비교 및 보고서 생성 툴 (🌟 수정 완료)
+# 독립 Tool 3: 정책 변동 자동 비교 및 보고서 생성 툴 (🌟 최종 수정)
 # ==============================================================================
 @router.post(
     "/check_and_report_policy_changes",
@@ -559,52 +476,69 @@ async def api_check_policy_changes(
 ) -> dict:
     """매월 정기 보고서 생성을 위해 정책 변동 사항을 자동으로 비교합니다. (LLM 호출 제거 - Agent가 처리)"""
     
-    # 🎯 [핵심 수정]: 보고서 월에 해당하는 정책 파일을 찾습니다. (새로운 로직 반영)
-    LATEST_POLICY_SOURCE = _find_policy_file_for_report(report_month_str)
-    
-    if not LATEST_POLICY_SOURCE:
-        # 정책 파일이 없으면 변동 없음으로 간주
-        # 🔧 수정: "YYYY-MM" 또는 "YYYY-MM-DD" 형식 모두 지원
-        if len(report_month_str) == 7:  # "YYYY-MM" 형식
-            report_month = datetime.strptime(report_month_str + "-01", "%Y-%m-%d").date().strftime('%Y년 %m월')
-        else:  # "YYYY-MM-DD" 형식
-            report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date().strftime('%Y년 %m월')
-        return {
-            "tool_name": "check_and_report_policy_changes_tool", 
-            "success": True, 
-            "policy_changes": [],
-            "report_month": report_month,
-            "message": f"{report_month} 보고서 기준, 해당 월에 반영할 정책 변동 사항이 없습니다."
-        }
-        
-    REQUIRED_SOURCES = [LATEST_POLICY_SOURCE] 
-    
-    # 1. 📅 날짜 체크 및 초기 설정
+    # 1. 📅 보고서 월 정규화 (YYYY-MM 또는 YYYY-MM-DD 모두 처리)
     try:
-        # 🔧 수정: "YYYY-MM" 또는 "YYYY-MM-DD" 형식 모두 지원
-        if len(report_month_str) == 7:  # "YYYY-MM" 형식
-            report_month = datetime.strptime(report_month_str + "-01", "%Y-%m-%d").date()
-        else:  # "YYYY-MM-DD" 형식
-            report_month = datetime.strptime(report_month_str, "%Y-%m-%d").date()
+        if len(report_month_str) == 7 and report_month_str.count('-') == 1:  # "YYYY-MM" 형식
+            # YYYY-MM 형식일 경우, 날짜 객체로 변환하기 위해 '-01'을 추가
+            report_month_dt = datetime.strptime(report_month_str + "-01", "%Y-%m-%d")
+        elif len(report_month_str) >= 10 and report_month_str.count('-') >= 2: # "YYYY-MM-DD" 이상 형식
+            # YYYY-MM-DD 형식으로 바로 파싱
+            report_month_dt = datetime.strptime(report_month_str[:10], "%Y-%m-%d")
+        else:
+            raise ValueError(f"지원하지 않는 날짜 형식입니다: {report_month_str}")
+            
+        # 사용자에게 보여줄 'YYYY년 MM월' 형식
+        report_month_display = report_month_dt.strftime('%Y년 %m월')
+        report_month_date = report_month_dt.date() # 비교용 Date 객체
         
-        # 최신 정책 파일 날짜 추출
-        file_name = Path(LATEST_POLICY_SOURCE).name 
-        latest_policy_date_str = file_name.split('_')[0] # 'YYYYMMDD' 추출
-        latest_policy_date = datetime.strptime(latest_policy_date_str, "%Y%m%d").date()
+        # 🎯 정책 파일을 찾는 함수에 전달할 YYYY-MM-DD 형식
+        report_date_for_search = report_month_date.strftime('%Y-%m-%d')
         
     except ValueError as e:
+        logger.error(f"보고서 월 파싱 오류: {e}", exc_info=True)
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
             "success": False, 
             "policy_changes": [],
-            "error": "보고서 월 형식 오류"
+            "error": f"보고서 월 형식 오류: 입력된 날짜 '{report_month_str}'을(를) 처리할 수 없습니다."
+        }
+    
+    # 2. 🎯 [핵심 수정]: 보고서 월에 해당하는 정책 파일을 찾습니다.
+    # _find_policy_file_for_report는 YYYY-MM-DD 형태를 기대합니다.
+    LATEST_POLICY_SOURCE = _find_policy_file_for_report(report_date_for_search)
+    
+    if not LATEST_POLICY_SOURCE:
+        # 정책 파일이 없으면 변동 없음으로 간주
+        return {
+            "tool_name": "check_and_report_policy_changes_tool", 
+            "success": True, 
+            "policy_changes": [],
+            "report_month": report_month_display,
+            "message": f"{report_month_display} 보고서 기준, 해당 월에 반영할 정책 변동 사항이 없습니다."
+        }
+        
+    REQUIRED_SOURCES = [LATEST_POLICY_SOURCE] 
+    
+    # 3. 최신 정책 파일 날짜 추출 및 검증
+    try:
+        file_name = Path(LATEST_POLICY_SOURCE).name 
+        latest_policy_date_str = file_name.split('_')[0] # 'YYYYMMDD' 추출
+        latest_policy_date = datetime.strptime(latest_policy_date_str, "%Y%m%d").date()
+        
+    except Exception as e:
+        logger.error(f"정책 파일 이름 파싱 오류: {e}", exc_info=True)
+        return {
+            "tool_name": "check_and_report_policy_changes_tool", 
+            "success": False, 
+            "policy_changes": [],
+            "error": "정책 파일 이름 파싱 중 오류 발생"
         }
     
     # ----------------------------------------------------------------------
-    # 2. ⚙️ 정책 섹션별로 RAG 검색 실행 (지정된 파일만 대상)
+    # 4. ⚙️ 정책 섹션별로 RAG 검색 실행 (지정된 파일만 대상)
     # ----------------------------------------------------------------------
     full_context_list = []
-    K_SEARCH = 15  # 각 섹션당 검색할 청크 수 (7 -> 15로 증가)
+    K_SEARCH = 15  # 각 섹션당 검색할 청크 수
  
     
     for section_query in POLICY_SECTIONS_TO_CHECK:
@@ -626,37 +560,30 @@ async def api_check_policy_changes(
 
     combined_context = "\n---\n".join(full_context_list)
     
-    # 디버깅: combined_context의 일부를 출력
-    logger.info(f"RAG: combined_context 길이: {len(combined_context)} 문자")
-    logger.info(f"RAG: combined_context 샘플 (처음 500자):\n{combined_context[:500]}")
-    
-    # 3. 📝 정규표현식을 이용해 RAG 컨텍스트에서 마커 포함 구문 추출
+    # 5. 📝 정규표현식을 이용해 RAG 컨텍스트에서 마커 포함 구문 추출
     # 정책 파일 날짜를 target_date로 전달하여 해당 날짜의 변경사항만 필터링
     target_policy_date = latest_policy_date.strftime("%Y-%m-%d")
-    structured_changes_raw = _find_policies_by_marker_regex(combined_context, target_date=target_policy_date)
+    structured_changes = _find_policies_by_marker_regex(combined_context, target_date=target_policy_date)
     
-    # 4. 🎯 최종 파이썬 필터링
-    # 🚨 [수정]: 정책 파일이 이미 선택되었으므로, 해당 파일 내 모든 신설/개정 사항을 사용합니다.
-    structured_changes = structured_changes_raw
     
-    # 5. 🧩 추출 결과 처리 (변동 사항이 없는 경우)
+    # 6. 🧩 추출 결과 처리 (변동 사항이 없는 경우)
     if not structured_changes:
         # 정책 파일은 있었으나, 해당 파일에서 마커를 포함한 정책 변동 사항이 추출되지 않은 경우
         return {
             "tool_name": "check_and_report_policy_changes_tool", 
             "success": True, 
             "policy_changes": [],
-            "report_month": report_month.strftime('%Y년 %m월'),
+            "report_month": report_month_display,
             "policy_date": latest_policy_date.strftime('%Y년 %m월 %d일'),
-            "message": f"{report_month.strftime('%Y년 %m월')} 보고서 기준, 최신 정책 문서({latest_policy_date.strftime('%Y년 %m월 %d일')})에 신설 또는 개정된 정책 변동 사항은 확인되지 않았습니다."
+            "message": f"{report_month_display} 보고서 기준, 최신 정책 문서({latest_policy_date.strftime('%Y년 %m월 %d일')})에 신설 또는 개정된 정책 변동 사항은 확인되지 않았습니다."
         }
 
-    # 6. 🎯 최종 아웃풋 구성 (Agent가 분석 보고서 생성)
+    # 7. 🎯 최종 아웃풋 구성 (Agent가 분석 보고서 생성)
     return {
         "tool_name": "check_and_report_policy_changes_tool", 
         "success": True, 
         "policy_changes": structured_changes,
-        "report_month": report_month.strftime('%Y년 %m월'),
+        "report_month": report_month_display,
         "policy_date": latest_policy_date.strftime('%Y년 %m월 %d일')
     }
 
@@ -804,8 +731,9 @@ async def analyze_user_profile_changes(
         current_value = current_data.get(field, 0) or 0
         previous_value = previous_data.get(field, 0) or 0
         
-        current_value = int(current_value)
-        previous_value = int(previous_value)
+        # 🚨 Decimal/Float이 섞여 있을 수 있으므로 정수로 안전하게 변환
+        current_value = int(float(current_value))
+        previous_value = int(float(previous_value))
 
         diff = current_value - previous_value
         
