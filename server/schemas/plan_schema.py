@@ -1026,7 +1026,8 @@ class ValidateSelectedFundsProductsResponse(BaseModel):
 # 20. [Fund] 선택 펀드 일괄 저장
 # -----------------------------
 class SaveSelectedFundItem(BaseModel):
-    fund_name: str = Field(..., description="펀드 상품명")
+    fund_name: Optional[str] = Field(None, description="펀드 상품명 (fund_name 또는 product_name 중 하나 필수)")
+    product_name: Optional[str] = Field(None, description="펀드 상품명 (fund_name 또는 product_name 중 하나 필수)")
     amount: int = Field(..., description="투자 금액(원)")
     fund_description: Optional[str] = Field(
         None,
@@ -1184,62 +1185,37 @@ class GetLoanProductResponse(BaseModel):
 
 class CalculateFinalLoanRequest(BaseModel):
     user_id: int = Field(..., description="사용자 ID (members.user_id)")
-    product_id: Optional[int] = Field(
-        1,
-        description="대출 상품 ID (기본값: 1)"
-    )
     target_price: int = Field(..., description="목표 주택 가격 (원 단위)")
-    is_regulated_area: bool = Field(
-        False,
-        description="규제지역 여부"
+    product_id: Optional[int] = Field(
+        None,
+        description="대출 상품 ID (없으면 기본 상품 사용, 실제 계산 버전에서만 사용)"
     )
 
 class CalculateFinalLoanResponse(BaseModel):
-    tool_name: Literal["calculate_final_loan"] = Field(
-        "calculate_final_loan",
-        description="최종 대출 금액 산정"
+    """
+    간단 버전 전용 응답 (핵심 필드만)
+    """
+    tool_name: Literal["calculate_final_loan_simple"] = Field(
+        "calculate_final_loan_simple",
+        description="간단 대출 계산"
     )
     success: bool = Field(..., description="처리 성공 여부")
     approved_amount: Optional[int] = Field(
         None,
-        description="대출 가능 금액 (원)"
+        description="대출 금액 (희망가격의 40%)"
     )
     down_payment_needed: Optional[int] = Field(
         None,
-        description="필요 자기자본 (원)"
+        description="필요한 자기자본 (원)"
     )
-    ltv_limit: Optional[int] = Field(
+    shortage_amount: Optional[int] = Field(
         None,
-        description="LTV 제한 금액 (원)"
-    )
-    dsr_limit: Optional[int] = Field(
-        None,
-        description="DSR 제한 금액 (원)"
-    )
-    dti_limit: Optional[int] = Field(
-        None,
-        description="DTI 제한 금액 (원)"
-    )
-    final_limit_reason: Optional[str] = Field(
-        None,
-        description="최종 제한 사유"
-    )
-    monthly_payment_estimate: Optional[int] = Field(
-        None,
-        description="예상 월 상환액 (원)"
-    )
-    loan_product: Optional[Dict[str, Any]] = Field(
-        None,
-        description="적용된 대출 상품 정보"
-    )
-    user_summary: Optional[Dict[str, Any]] = Field(
-        None,
-        description="사용자 요약 정보"
+        description="부족한 자기자본 (원)"
     )
     error: Optional[str] = Field(
         None,
-        description="오류 메시지(실패 시)"
-    )    
+        description="오류 메시지"
+    )   
     
 
 # ============================================================

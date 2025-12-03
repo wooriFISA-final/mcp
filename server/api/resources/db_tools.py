@@ -1490,7 +1490,8 @@ async def save_selected_funds_products(
     try:
         with engine.begin() as conn:
             for item in selected_funds:
-                fund_name = item.fund_name
+                # 지원하는 두 필드를 우선순위로 처리: fund_name 우선, 없으면 product_name 사용
+                fund_name = getattr(item, 'fund_name', None) or getattr(item, 'product_name', None)
                 amount = item.amount
                 fund_desc = item.fund_description or ""
                 expected_yield = item.expected_yield
@@ -1641,7 +1642,7 @@ async def api_get_user_full_profile(
                     annual_salary
                 FROM members_info
                 WHERE user_id = :uid
-                ORDER BY year_month ASC
+                ORDER BY `year_month` ASC
                 LIMIT 1
                 """
             )

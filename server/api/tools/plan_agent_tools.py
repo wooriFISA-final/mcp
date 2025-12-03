@@ -96,7 +96,8 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_NAME = os.getenv("DB_NAME")
 
-
+# db_url = f"mysql+pymysql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}"
+# engine = create_engine(db_url)
 # 개선된 엔진 설정
 engine = create_engine(
     f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}",
@@ -1407,9 +1408,6 @@ async def api_calculate_ltv(
 ):
     """LTV(Loan To Value) 비율 계산"""
     try:
-        from sqlalchemy import create_engine, text
-        import os
-        
         # ✅ 안전한 타입 변환 헬퍼 함수
         def _safe_int(v, default: int = 0) -> int:
             """None, 문자열 'None', 빈 문자열 등을 안전하게 int로 변환"""
@@ -1660,68 +1658,30 @@ async def api_get_loan_product(
 
 
 @router.post(
-    "/calculate_final_loan",
+    "/calculate_final_loan_simple",
     summary="최종 대출 가능 금액 산정",
-    operation_id="calculate_final_loan",
+    operation_id="calculate_final_loan_simple",
     description=(
-        "LTV, DSR, DTI를 종합적으로 고려하여 최종 대출 가능 금액을 계산합니다.\n\n"
-        "**고려사항:**\n"
-        "1. LTV 제한 (주택유형/가격구간/규제지역/신용점수 반영)\n"
-        "2. DSR 제한 (40% - 현재 DSR)\n"
-        "3. DTI 제한 (60% - 현재 DTI)\n"
-        "4. 초기 자산 확인 (members.initial_prop)\n"
-        "5. 상환 능력 검증\n\n"
-        "**계산식:**\n"
-        "- 월 상환액 = 대출금 × 월이자율 × (1+월이자율)^개월수 / ((1+월이자율)^개월수 - 1)\n"
-        "- 기본 금리: 3.5%, 기간: 30년 (360개월)"
+        "LTV, DSR, DTI를 종합적으로 고려하여 최종 대출 가능 금액을 계산합니다."
     ),
     response_model=CalculateFinalLoanResponse,
 )
-async def api_calculate_final_loan(
-    request: CalculateFinalLoanRequest = Body(
-        ...,
-        description="최종 대출 금액 산정 요청",
-    )
+# 대출금 40% 고정해서 받는 버전
+async def api_calculate_final_loan_simple(
+    request: CalculateFinalLoanRequest = Body(..., description="최종 대출 금액 산정")
 ):
     """
-    최종 대출 금액 산정
+    최종 대출 금액 산정 - 간단 버전
     
-    LTV, DSR, DTI를 종합적으로 고려하여 최종 대출 가능 금액을 계산합니다.
-    
-    고려사항:
-    1. LTV 제한
-    2. DSR 제한 (40% - 현재 DSR)
-    3. DTI 제한 (60% - 현재 DTI)
-    4. 초기 자산 확인 (members.initial_prop)
-    5. 상환 능력 검증
-    
-    계산식:
-    - 월 상환액 = 대출금 × 월이자율 × (1+월이자율)^개월수 / ((1+월이자율)^개월수 - 1)
-    - 금리: 3.5% (기본), 기간: 30년 (360개월)
+    희망 주택가격의 40%를 대출금액으로 산정
     """
     try:
-        # 안전한 타입 변환 헬퍼 함수
-        def _to_int(v: Any, default: int = 0) -> int:
-            """None, 문자열 'None', 빈 문자열 등을 안전하게 int로 변환"""
-            try:
-                if v is None or v == '' or str(v).lower() == 'none':
-                    return default
-                return int(float(v))
-            except (ValueError, TypeError):
-                return default
-        
         with engine.connect() as conn:
-            # 1. 사용자 정보 조회 (간소화)
+            # 사용자 초기 자본 조회
             user_query = text("""
-                SELECT 
-                    m.initial_prop, 
-                    mi.annual_salary, 
-                    mi.credit_score
-                FROM members m
-                LEFT JOIN members_info mi ON m.user_id = mi.user_id
-                WHERE m.user_id = :user_id
-                ORDER BY mi.year_month DESC
-                LIMIT 1
+                SELECT initial_prop, is_loan_possible
+                FROM members
+                WHERE user_id = :user_id
             """)
             
             user_row = conn.execute(user_query, {"user_id": request.user_id}).fetchone()
@@ -1732,89 +1692,42 @@ async def api_calculate_final_loan(
                     error="사용자 정보를 찾을 수 없습니다"
                 )
             
-            initial_prop = _to_int(user_row[0], 0)
-            annual_salary = _to_int(user_row[1], 0)
-            credit_score = _to_int(user_row[2], 700)
+            initial_prop = user_row[0] or 0
+            is_loan_possible = user_row[1]
             
-            # 2. 대출 상품 조회
-            product_req = GetLoanProductRequest(product_id=request.product_id)
-            product_response = await api_get_loan_product(product_req)
-            
-            if not product_response.success:
+            if is_loan_possible == 0:
                 return CalculateFinalLoanResponse(
                     success=False,
-                    error=product_response.error
+                    error="대출 불가능 상태입니다"
                 )
             
-            # 3. ✨ 고정 비율 15% 적용 (단순 계산)
-            FIXED_LOAN_RATIO = 0.15  # 15%
-            target_price = _to_int(request.target_price, 0)
-            approved_amount = int(target_price * FIXED_LOAN_RATIO)
-            
-            logger.info(f"💰 고정 비율 대출 계산: {target_price:,}원 × {FIXED_LOAN_RATIO*100}% = {approved_amount:,}원")
-            
-            if approved_amount <= 0:
-                return CalculateFinalLoanResponse(
-                    success=False,
-                    error="대출 가능 금액이 0원입니다. 조건 확인 필요"
-                )
-            
-            # 4. 필요 자기자본 계산
-            down_payment_needed = target_price - approved_amount
+            # 대출 금액 = 희망 주택가격 × 40%
+            approved_amount = int(request.target_price * 0.4)
+            down_payment_needed = request.target_price - approved_amount
             
             if down_payment_needed > initial_prop:
                 shortage = down_payment_needed - initial_prop
                 return CalculateFinalLoanResponse(
                     success=False,
-                    error=f"자기자본 {shortage:,}원 부족 (필요: {down_payment_needed:,}원, 보유: {initial_prop:,}원)"
+                    approved_amount=approved_amount,
+                    shortage_amount=shortage,
+                    down_payment_needed=down_payment_needed,
+                    error=f"자기자본 {shortage:,}원 부족"
                 )
             
-            # 5. 예상 월 상환액 (간단 계산)
-            monthly_rate = 0.035 / 12
-            n_months = 360
-            payment_factor = (
-                monthly_rate * (1 + monthly_rate) ** n_months
-            ) / ((1 + monthly_rate) ** n_months - 1) if monthly_rate > 0 else 0
-            
-            monthly_payment = _to_int(approved_amount * payment_factor, 0)
-            
-            # 대출 상품 정보
-            loan_product_info = {
-                "product_id": product_response.product_id,
-                "product_name": product_response.product_name,
-                "bank_name": product_response.bank_name,
-                "rate_description": product_response.rate_description,
-                "repayment_method": product_response.repayment_method
-            }
-            
-            # 사용자 요약
-            user_summary = {
-                "credit_score": credit_score,
-                "annual_salary": annual_salary,
-                "initial_capital": initial_prop
-            }
-            
-            logger.info(f"✅ 최종 대출 계산 완료: 승인금액 {approved_amount:,}원, 월상환 {monthly_payment:,}원")
-            logger.info(f"   제한사유: 고정 비율 {FIXED_LOAN_RATIO*100}% 적용")
+            logger.info(f"✅ 간단 대출 산정: {approved_amount:,}원 (40% 고정)")
             
             return CalculateFinalLoanResponse(
                 success=True,
                 approved_amount=approved_amount,
-                down_payment_needed=down_payment_needed,
-                ltv_limit=approved_amount,  # 고정 비율이므로 동일
-                dsr_limit=None,
-                dti_limit=None,
-                final_limit_reason=f"고정 비율 {FIXED_LOAN_RATIO*100}% 적용",
-                monthly_payment_estimate=monthly_payment,
-                loan_product=loan_product_info,
-                user_summary=user_summary
+                down_payment_needed=down_payment_needed
             )
             
     except Exception as e:
-        logger.error(f"❌ 최종 대출 계산 실패: {e}", exc_info=True)
+        logger.error(f"❌ 대출 계산 실패: {e}", exc_info=True)
         return CalculateFinalLoanResponse(
             success=False,
-            error=f"최종 대출 계산 실패: {str(e)}"
+            error=f"대출 계산 실패: {str(e)}"
         )
 # ============================================================
 # Summary Agent MCP Tools
@@ -1825,7 +1738,7 @@ async def api_calculate_final_loan(
 @router.post(
     "/simulate_investment",
     summary="복리 기반 투자 시뮬레이션",
-    operation_id="simulate_combined_investment",
+    operation_id="simulate_investment",
     description=(
         "부족 자금을 채우기 위한 **예금/적금 + 펀드** 복합 투자 시뮬레이션을 수행합니다."
     ),
