@@ -37,6 +37,11 @@ def create_app() -> FastAPI:
             "api": "/api",
             "mcp": "/mcp",
         }
+    
+    @root_app.get("/health")
+    async def health() -> dict:
+        return {"status": "healthy"}
+    
     return root_app
 
 app = create_app()

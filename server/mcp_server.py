@@ -3,9 +3,9 @@
 # ============================================
 from fastmcp import FastMCP
 from fastapi import FastAPI
-from server.api.tools.user_tools import create_user, get_user
-from server.api.resources.user_resources import get_user_stats, get_all_users_resource
-from server.api.prompts.user_prompts import user_greeting, user_report
+# from server.api.tools.user_tools import create_user, get_user
+# from server.api.resources.user_resources import get_user_stats, get_all_users_resource
+# from server.api.prompts.user_prompts import user_greeting, user_report
 from server.routes import data_route
 from server.routes import mcp_route
 
