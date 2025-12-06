@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+.git
+.gitignore
+*.md
+.python-version
+uv.lock
+.DS_Store
+*.log
