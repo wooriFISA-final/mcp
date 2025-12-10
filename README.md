@@ -15,6 +15,14 @@
 
 ---
 
+### 📊 API 문서 (Swagger)
+<!-- Swagger UI 스크린샷 -->
+<img width="1458" height="1110" alt="Image" src="https://github.com/user-attachments/assets/957bd8e5-4b94-4cf0-83d8-2e90d6bdcc57" />
+
+<img width="1448" height="648" alt="Image" src="https://github.com/user-attachments/assets/b282ab3c-07d7-445d-837c-d011addfd55f" />
+
+---
+
 ## 📋 Table of Contents
 
 - [Features](#-features)
@@ -48,6 +56,54 @@
 - 📋 **정책 문서 검색** - 주택청약 정책 RAG
 
 ---
+
+## 🏗 Architecture
+
+```mermaid
+graph TB
+    subgraph Client
+        A[Agent Server / LLM]
+    end
+    
+    subgraph MCP Server
+        B[FastAPI Application]
+        C[FastMCP Engine]
+        
+        subgraph Routes
+            D[/mcp - MCP Endpoint]
+            E[/api - REST API]
+        end
+        
+        subgraph Tools
+            F[Plan Agent Tools]
+            G[Report Agent Tools]
+        end
+        
+        subgraph RAG
+            H[FAISS Deposit Index]
+            I[FAISS Saving Index]
+            J[Policy RAG]
+        end
+    end
+    
+    subgraph External
+        K[MySQL RDS]
+        L[Embedding API]
+        M[Backend API]
+    end
+    
+    A -->|JSON-RPC 2.0| D
+    A -->|REST| E
+    D --> C
+    C --> F & G
+    F & G --> H & I & J
+    F & G --> K
+    G --> M
+    H & I & J --> L
+```
+
+---
+
 ## 🚀 Quick Start
 
 ### Prerequisites
