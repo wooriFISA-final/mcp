@@ -43,7 +43,11 @@ from server.schemas.plan_schema import (
     GetUserProductsRequest,
     GetUserProductsResponse,
     GetUserLoanInfoRequest,
-    GetUserLoanInfoResponse
+    GetUserLoanInfoResponse,
+    GetMlRankedFundsRequest,
+    GetMlRankedFundsResponse,
+    GetInvestmentRatioRequest,
+    GetInvestmentRatioResponse
 )
 
 # ----------------------------------
@@ -713,17 +717,17 @@ async def api_get_user_profile_for_fund(
     "/get_ml_ranked_funds",
     summary="투자성향 및 조건별 ML 펀드 랭킹 조회",
     operation_id="get_ml_ranked_funds",
-    response_model=dict,
+    response_model=GetMlRankedFundsResponse,
 )
 async def api_get_ml_ranked_funds(
-    payload: Dict[str, Any] = Body(...),
-) -> dict:
+    payload: GetMlRankedFundsRequest = Body(...),
+) -> GetMlRankedFundsResponse:
     """
     DB의 fund_ranking_snapshot 테이블에서 성향에 맞는 펀드를 조회하는 Tool.
     """
     # 1. 입력값 추출
-    invest_tendency = payload.get("invest_tendency")
-    sort_by = payload.get("sort_by", "score")  # 기본값: 종합 점수(score)
+    invest_tendency = payload.invest_tendency
+    sort_by = payload.sort_by or "score"  # 기본값: 종합 점수(score)
 
     # 2. [Validation] 필수 값 확인
     if not invest_tendency:
@@ -1011,15 +1015,15 @@ async def api_add_my_fund(
     "/get_investment_ratio",
     summary="투자 성향별 추천 비율 조회",
     operation_id="get_investment_ratio",
-    response_model=dict,
+    response_model=GetInvestmentRatioResponse,
 )
 async def api_get_investment_ratio(
-    payload: Dict[str, Any] = Body(...),
-) -> dict:
+    payload: GetInvestmentRatioRequest = Body(...),
+) -> GetInvestmentRatioResponse:
     """
     investment_ratio_recommendation 테이블에서 성향별 포트폴리오 비율 조회 Tool.
     """
-    invest_tendency = payload.get("invest_tendency")
+    invest_tendency = payload.invest_tendency
 
     if not invest_tendency:
         return {
